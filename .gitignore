@@ -2,9 +2,11 @@
 .venv/
 __pycache__/
 data/
+logs/
 models/
 tools/downloads/
 tools/ffmpeg/
 tools/whisper/source/
 tools/whisper/build-vulkan/
 tools/whisper/bin/
+/artifacts/video_3_week_6_stream/

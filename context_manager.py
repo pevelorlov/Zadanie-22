@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from copy import deepcopy
 from typing import Any
@@ -11,12 +12,15 @@ from agent import Agent, normalize_token_usage
 from storage import now_iso
 
 
+logger = logging.getLogger("deepseek_agent.context")
+
+
 FULL_MODE = "full"
 SUMMARY_MODE = "summary"
 SLIDING_MODE = "sliding"
 FACTS_MODE = "facts"
-BRANCHING_MODE = "branching"
-CONTEXT_MODES = {FULL_MODE, SUMMARY_MODE, SLIDING_MODE, FACTS_MODE, BRANCHING_MODE}
+LEGACY_BRANCHING_MODE = "branching"
+CONTEXT_MODES = {FULL_MODE, SUMMARY_MODE, SLIDING_MODE, FACTS_MODE}
 KEEP_RECENT_EXCHANGES = 5
 SUMMARY_BATCH_EXCHANGES = 5
 SUMMARY_MODEL = "deepseek-v4-flash"
@@ -34,7 +38,7 @@ def ensure_context_management(conversation: dict[str, Any]) -> dict[str, Any]:
     raw = conversation.get("context_management")
     value = raw if isinstance(raw, dict) else {}
     mode = value.get("mode")
-    if mode not in CONTEXT_MODES:
+    if mode == LEGACY_BRANCHING_MODE or mode not in CONTEXT_MODES:
         mode = FULL_MODE
     normalized = {
         "mode": mode,
@@ -225,6 +229,40 @@ def completed_exchanges(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def current_stage_exchanges(conversation: dict[str, Any]) -> list[dict[str, Any]]:
+    """Ограничивает успешную историю текущим посещением этапа после первого handoff."""
+    exchanges = completed_exchanges(active_path_messages(conversation))
+    if not conversation.get("task_handoffs"):
+        current_stage = conversation.get("task_state", {}).get("stage")
+        selected_reversed = []
+        for exchange in reversed(exchanges):
+            assistant = next((item for item in exchange.get("messages", []) if item.get("role") == "assistant"), None)
+            snapshot_stage = (assistant or {}).get("technical", {}).get("task_state", {}).get("stage")
+            if snapshot_stage == current_stage:
+                selected_reversed.append(exchange)
+            elif selected_reversed and snapshot_stage:
+                break
+        return list(reversed(selected_reversed)) if selected_reversed else exchanges
+    state = conversation.get("task_state") if isinstance(conversation.get("task_state"), dict) else {}
+    run_id = state.get("stage_run_id")
+    result = []
+    for exchange in exchanges:
+        assistant = next((item for item in exchange.get("messages", []) if item.get("role") == "assistant"), None)
+        snapshot = (assistant or {}).get("technical", {}).get("task_state", {})
+        if snapshot.get("stage_run_id") == run_id:
+            result.append(exchange)
+    return result
+
+
+def current_stage_facts(conversation: dict[str, Any]) -> list[dict[str, Any]]:
+    facts = [item for item in conversation.get("facts", []) if isinstance(item, dict)]
+    if not conversation.get("task_handoffs"):
+        return facts
+    state = conversation.get("task_state") if isinstance(conversation.get("task_state"), dict) else {}
+    run_id = state.get("stage_run_id")
+    return [item for item in facts if item.get("stage_run_id") == run_id]
+
+
 def active_summary(conversation: dict[str, Any]) -> dict[str, Any] | None:
     context = ensure_context_management(conversation)
     for summary in reversed(conversation["summaries"]):
@@ -237,7 +275,7 @@ def update_summaries(conversation: dict[str, Any], agent: Agent) -> list[dict[st
     context = ensure_context_management(conversation)
     if context["mode"] != SUMMARY_MODE:
         return []
-    exchanges = completed_exchanges(active_path_messages(conversation))
+    exchanges = current_stage_exchanges(conversation)
     current = active_summary(conversation)
     covered_ids = list(current.get("covered_exchange_ids", [])) if current else []
     completed_ids = [item["exchange_id"] for item in exchanges]
@@ -249,6 +287,10 @@ def update_summaries(conversation: dict[str, Any], agent: Agent) -> list[dict[st
     created: list[dict[str, Any]] = []
     while older_count - len(covered_ids) >= SUMMARY_BATCH_EXCHANGES:
         batch = exchanges[len(covered_ids):len(covered_ids) + SUMMARY_BATCH_EXCHANGES]
+        logger.info(
+            "Обновление summary начато | conversation_id=%s | exchanges=%s | previous=%s",
+            conversation.get("id", "-"), len(batch), current.get("id") if current else "-",
+        )
         result = agent.summarize(current.get("content", "") if current else "", batch)
         source_messages = [message for exchange in batch for message in exchange["messages"]]
         new_covered_ids = covered_ids + [exchange["exchange_id"] for exchange in batch]
@@ -264,6 +306,10 @@ def update_summaries(conversation: dict[str, Any], agent: Agent) -> list[dict[st
         context["active_summary_id"] = revision["id"]
         current, covered_ids = revision, new_covered_ids
         created.append(revision)
+        logger.info(
+            "Summary обновлён | conversation_id=%s | summary_id=%s | covered=%s",
+            conversation.get("id", "-"), revision["id"], len(new_covered_ids),
+        )
     return created
 
 
@@ -271,7 +317,7 @@ def request_history(conversation: dict[str, Any]) -> tuple[list[dict[str, Any]],
     """Собирает историю, summary/facts и снимок реально отправленной стратегии."""
     context = ensure_context_management(conversation)
     path = active_path_messages(conversation)
-    exchanges = completed_exchanges(path)
+    exchanges = current_stage_exchanges(conversation)
     mode = context["mode"]
     if mode == SUMMARY_MODE:
         current = active_summary(conversation)
@@ -282,6 +328,7 @@ def request_history(conversation: dict[str, Any]) -> tuple[list[dict[str, Any]],
             "mode": mode, "summary_id": current.get("id") if current else None,
             "summary_exchange_count": len(covered_ids), "verbatim_exchange_count": len(raw_exchanges),
             "keep_recent_exchanges": KEEP_RECENT_EXCHANGES,
+            "stage_run_id": conversation.get("task_state", {}).get("stage_run_id"),
         }
     if mode == SLIDING_MODE:
         limit = context["sliding_window_exchanges"]
@@ -293,11 +340,12 @@ def request_history(conversation: dict[str, Any]) -> tuple[list[dict[str, Any]],
         limit = None
         selected = exchanges
     history = [deepcopy(message) for exchange in selected for message in exchange["messages"]]
-    facts = [{"key": item["key"], "value": item["value"]} for item in conversation["facts"] if isinstance(item, dict) and item.get("key") and item.get("value")] if mode == FACTS_MODE else []
+    facts = [{"key": item["key"], "value": item["value"]} for item in current_stage_facts(conversation) if item.get("key") and item.get("value")] if mode == FACTS_MODE else []
     return history, "", facts, {
         "mode": mode, "summary_id": None, "summary_exchange_count": 0,
         "verbatim_exchange_count": len(selected), "window_exchanges": limit,
         "fact_count": len(facts), "active_leaf_id": context.get("active_leaf_id"),
+        "stage_run_id": conversation.get("task_state", {}).get("stage_run_id"),
     }
 
 
@@ -305,15 +353,21 @@ def update_sticky_facts(conversation: dict[str, Any], agent: Agent, user_text: s
     context = ensure_context_management(conversation)
     if context["mode"] != FACTS_MODE:
         return None
-    current = [{"key": item.get("key"), "value": item.get("value"), "locked": bool(item.get("locked"))} for item in conversation["facts"] if isinstance(item, dict)]
+    stage_run_id = conversation.get("task_state", {}).get("stage_run_id")
+    stage_items = current_stage_facts(conversation)
+    current = [{"key": item.get("key"), "value": item.get("value"), "locked": bool(item.get("locked"))} for item in stage_items]
     revision: dict[str, Any] = {"id": uuid.uuid4().hex, "created_at": now_iso(), "purpose": "facts_update"}
     try:
+        logger.info(
+            "Обновление Sticky Facts начато | conversation_id=%s | current_facts=%s",
+            conversation.get("id", "-"), len(current),
+        )
         result = agent.extract_facts(current, user_text)
         parsed = json.loads(result.content)
         raw_facts = parsed.get("facts") if isinstance(parsed, dict) else None
         if not isinstance(raw_facts, list):
             raise ValueError("DeepSeek не вернул массив facts.")
-        locked = {item["key"]: item for item in conversation["facts"] if isinstance(item, dict) and item.get("locked") and item.get("key")}
+        locked = {item["key"]: item for item in stage_items if item.get("locked") and item.get("key")}
         updated: list[dict[str, Any]] = list(locked.values())
         used_keys = set(locked)
         for raw in raw_facts:
@@ -323,19 +377,30 @@ def update_sticky_facts(conversation: dict[str, Any], agent: Agent, user_text: s
             value = clean_fact_value(raw.get("value"))
             if not key or not value or key in used_keys:
                 continue
-            previous = next((item for item in conversation["facts"] if isinstance(item, dict) and item.get("key") == key), None)
+            previous = next((item for item in stage_items if item.get("key") == key), None)
             updated.append({
                 "id": previous.get("id") if previous else uuid.uuid4().hex,
                 "key": key, "value": value, "locked": False, "source": "auto",
                 "created_at": previous.get("created_at") if previous else now_iso(), "updated_at": now_iso(),
+                "stage_run_id": stage_run_id,
             })
             used_keys.add(key)
-        conversation["facts"] = updated
+        old_stage_ids = {id(item) for item in stage_items}
+        preserved = [item for item in conversation["facts"] if id(item) not in old_stage_ids]
+        conversation["facts"] = preserved + updated
         revision.update({
             "status": "completed", "fact_count": len(updated),
             "technical": {**result.technical, "usage": normalize_token_usage(result.technical.get("usage"))},
         })
+        logger.info(
+            "Sticky Facts обновлены | conversation_id=%s | facts=%s",
+            conversation.get("id", "-"), len(updated),
+        )
     except Exception as error:
+        logger.warning(
+            "Не удалось обновить Sticky Facts | conversation_id=%s",
+            conversation.get("id", "-"), exc_info=True,
+        )
         revision.update({"status": "failed", "error": str(error), "technical": {"usage": normalize_token_usage({})}})
     conversation["fact_revisions"].append(revision)
     return revision
@@ -346,9 +411,9 @@ def add_fact(conversation: dict[str, Any], key: Any, value: Any) -> dict[str, An
     clean_key, clean_value = clean_fact_key(key), clean_fact_value(value)
     if not clean_key or not clean_value:
         raise ValueError("Укажите ключ вида goal.name и непустое значение.")
-    if any(item.get("key") == clean_key for item in conversation["facts"] if isinstance(item, dict)):
+    if any(item.get("key") == clean_key for item in current_stage_facts(conversation)):
         raise ValueError("Факт с таким ключом уже существует.")
-    fact = {"id": uuid.uuid4().hex, "key": clean_key, "value": clean_value, "locked": True, "source": "manual", "created_at": now_iso(), "updated_at": now_iso()}
+    fact = {"id": uuid.uuid4().hex, "key": clean_key, "value": clean_value, "locked": True, "source": "manual", "created_at": now_iso(), "updated_at": now_iso(), "stage_run_id": conversation.get("task_state", {}).get("stage_run_id")}
     conversation["facts"].append(fact)
     return fact
 

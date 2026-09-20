@@ -5,16 +5,29 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Локальный многодиалоговый агент DeepSeek">
   <title>DeepSeek Agent</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260912-10') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260920-artifacts-1') }}">
 </head>
 <body>
   <div class="app-shell">
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark">D</span><div><strong>DeepSeek Agent</strong><small>Локальная история JSON</small></div></div>
-      <button id="new-chat" class="primary wide" type="button">＋ Новый диалог</button>
-      <div class="sidebar-heading"><span>Диалоги</span><button id="import-button" class="icon-button" title="Импортировать JSON">⇧</button></div>
+      <div class="profile-switcher">
+        <label>Активный профиль<select id="profile-select" aria-label="Активный профиль"></select></label>
+        <button id="profile-edit" class="icon-button" type="button" title="Изменить активный профиль">✎</button>
+        <button id="profile-create" class="icon-button" type="button" title="Создать профиль">＋</button>
+      </div>
+      <div class="sidebar-create-actions">
+        <button id="new-chat" class="primary" type="button">＋ Диалог</button>
+        <button id="new-project" class="secondary" type="button">＋ Проект</button>
+      </div>
+      <form id="new-project-form" class="sidebar-project-form" hidden>
+        <input id="new-project-name" maxlength="120" placeholder="Название проекта" required>
+        <div><button class="primary" type="submit">Создать</button><button id="new-project-cancel" class="secondary" type="button">Отмена</button></div>
+      </form>
+      <div class="sidebar-heading"><span>Проекты и диалоги</span><button id="import-button" class="icon-button" title="Импортировать JSON">⇧</button></div>
       <input id="import-file" type="file" accept="application/json,.json" hidden>
       <nav id="conversation-list" class="conversation-list" aria-label="Диалоги"></nav>
+      <p id="sidebar-project-status" class="sidebar-project-status" role="status"></p>
       <div class="sidebar-footer">
         <button id="presets-button" class="secondary wide" type="button">Управление пресетами</button>
         <small>Ключ хранится только в .env</small>
@@ -29,6 +42,7 @@
           <div id="token-overview" class="token-overview" aria-label="Накопленные токены диалога" hidden></div>
         </div>
         <div class="header-actions">
+          <button id="memory-button" class="primary" type="button">Память</button>
           <button id="export-button" class="secondary" type="button">Экспорт JSON</button>
           <button id="delete-chat" class="danger" type="button">Удалить</button>
         </div>
@@ -52,7 +66,7 @@
           <span id="request-status" class="request-status" role="status" hidden><i></i> Запрос отправлен · ожидаем DeepSeek</span>
         </div>
         <form id="message-form" class="composer">
-          <textarea id="message-input" maxlength="50000" rows="1" placeholder="Напишите сообщение…" required></textarea>
+          <textarea id="message-input" maxlength="50000" rows="1" placeholder="Напишите сообщение…"></textarea>
           <button id="voice-button" class="voice-button" type="button" title="Надиктовать сообщение" aria-label="Надиктовать сообщение" disabled>
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2Z"/></svg>
           </button>
@@ -68,13 +82,87 @@
         <span id="context-status" class="context-status">Полная история</span>
       </div>
       <div class="context-scroll">
+        <section class="task-state-card" aria-labelledby="task-state-title">
+          <div class="section-title">
+            <div><small>ДЕНЬ 15</small><h3 id="task-state-title">Контролируемый жизненный цикл</h3></div>
+            <span id="task-activity-badge" class="task-activity-badge">Активна</span>
+          </div>
+          <label>Описание задачи
+            <textarea id="task-description" maxlength="2000" rows="2" placeholder="Что требуется сделать"></textarea>
+          </label>
+          <label>Управление переходами
+            <select id="task-transition-mode">
+              <option value="manual">Вручную · разрешённые кнопки</option>
+              <option value="automatic">Автопилот · продолжать самостоятельно</option>
+            </select>
+          </label>
+          <label>Этап
+            <select id="task-stage" disabled aria-label="Текущий этап изменяется событиями автомата">
+              <option value="planning">Планирование</option>
+              <option value="execution">Выполнение</option>
+              <option value="validation">Проверка</option>
+              <option value="done">Завершено</option>
+            </select>
+          </label>
+          <label>Текущий шаг
+            <input id="task-current-step" maxlength="1000" placeholder="Например: согласовать структуру">
+          </label>
+          <label>Ожидаемое действие
+            <input id="task-expected-action" maxlength="1000" placeholder="Например: решение пользователя">
+          </label>
+          <label>Краткий план
+            <textarea id="task-plan" maxlength="4000" rows="3" placeholder="Зафиксированный план задачи"></textarea>
+          </label>
+          <div class="task-state-actions">
+            <button id="task-state-save" class="primary" type="button">Сохранить</button>
+            <button id="task-activity-toggle" class="secondary" type="button">Приостановить</button>
+            <button id="task-autopilot-stop" class="danger" type="button" disabled>Остановить автопилот</button>
+            <button id="task-state-show" class="secondary" type="button">Показать состояние</button>
+          </div>
+          <div id="task-transition-actions" class="task-transition-actions" aria-label="Разрешённые переходы"></div>
+          <small id="task-state-note" class="task-state-note">Этап изменяется только разрешённым событием жизненного цикла.</small>
+          <details class="task-handoff-context" open>
+            <summary>Контекст текущего этапа (<span id="task-handoff-count">0</span>)</summary>
+            <small id="task-handoff-note">До первого handoff используется последний непрерывный фрагмент текущего этапа.</small>
+            <div id="task-handoff-list"></div>
+          </details>
+          <pre id="task-state-report" class="task-state-report" hidden></pre>
+          <details class="task-transition-history">
+            <summary>История состояния (<span id="task-history-count">0</span>)</summary>
+            <div id="task-history-list"></div>
+          </details>
+        </section>
+        <section class="invariants-card" aria-labelledby="invariants-title">
+          <div class="section-title"><div><small>ДЕНЬ 14</small><h3 id="invariants-title">Инварианты</h3></div><span id="invariants-count">0 активных</span></div>
+          <small>Слои применяются вместе: системный → пользователь → проект → задача.</small>
+          <label>Редактируемый слой
+            <select id="invariant-scope">
+              <option value="task">Конкретная задача</option>
+              <option value="project">Текущий проект</option>
+              <option value="user">Профиль пользователя</option>
+            </select>
+          </label>
+          <input id="invariant-set-id" type="hidden">
+          <label>Название варианта
+            <input id="invariant-name" maxlength="120" placeholder="Например: Flask без внешнего аудио">
+          </label>
+          <label>Правила — по одному в строке
+            <textarea id="invariant-rules" maxlength="12000" rows="4" placeholder="Использовать Flask&#10;Не отправлять аудио во внешние сервисы"></textarea>
+          </label>
+          <label class="invariant-enabled"><input id="invariant-enabled" type="checkbox" checked> Набор активен</label>
+          <div class="invariant-actions">
+            <button id="invariant-save" class="primary" type="button">Сохранить набор</button>
+            <button id="invariant-cancel" class="secondary" type="button">Новый</button>
+          </div>
+          <p id="invariant-error" class="error-text"></p>
+          <div id="invariant-layers" class="invariant-layers"></div>
+        </section>
         <label class="context-mode-label">Режим этого диалога
           <select id="context-mode">
             <option value="full">Полная история</option>
             <option value="summary">Summary + последние обмены</option>
             <option value="sliding">Sliding Window</option>
             <option value="facts">Sticky Facts</option>
-            <option value="branching">Branching</option>
           </select>
         </label>
         <label id="window-setting" class="context-mode-label" hidden>Последние обмены (1–50)
@@ -94,7 +182,10 @@
           <div id="summary-history" class="summary-history"></div>
         </section>
         <section id="facts-section" hidden>
-          <div class="section-title"><strong>Sticky Facts</strong><small id="facts-count">0 фактов</small></div>
+          <div class="section-title">
+            <span class="facts-title"><strong>Sticky Facts</strong><button id="facts-help-button" class="help-button" type="button" title="Как правильно добавить Sticky Fact" aria-label="Открыть справку по Sticky Facts" aria-haspopup="dialog">?</button></span>
+            <small id="facts-count">0 фактов</small>
+          </div>
           <div id="facts-list" class="facts-list"></div>
           <form id="fact-form" class="fact-form">
             <input id="fact-key" maxlength="120" placeholder="goal.primary" required>
@@ -103,9 +194,9 @@
           </form>
           <p id="facts-error" class="error-text"></p>
         </section>
-        <section id="branching-section" hidden>
+        <section id="branching-section">
           <div class="section-title"><strong>Ветки</strong><small id="branch-count">1 путь</small></div>
-          <p class="branch-help">Нажмите «Разветвить» после любого сообщения. Переключатели 1/N появятся возле точки разделения.</p>
+          <p class="branch-help">Ветвление доступно во всех режимах. Слева от вашего сообщения создаётся другой ответ модели; справа от ответа модели — новое продолжение диалога.</p>
         </section>
       </div>
       <p class="context-foot">Полные сообщения, ветки, facts и версии summary сохраняются вместе в JSON диалога.</p>
@@ -159,9 +250,128 @@
     </form>
   </dialog>
 
+  <dialog id="profile-dialog" aria-labelledby="profile-dialog-title">
+    <form method="dialog" class="dialog-card profile-card" id="profile-form">
+      <div class="panel-heading"><div><small>ДЕНЬ 12</small><h2 id="profile-dialog-title">Профиль пользователя</h2></div><button class="icon-button" value="cancel" aria-label="Закрыть">×</button></div>
+      <input id="profile-edit-id" type="hidden">
+      <label>Имя профиля<input id="profile-name" maxlength="80" required></label>
+      <div class="two-columns">
+        <label>Язык<select id="profile-language"><option value="ru">Русский</option><option value="en">Английский</option><option value="auto">По запросу</option></select></label>
+        <label>Технический уровень<select id="profile-technical-level"><option value="beginner">Начальный</option><option value="intermediate">Средний</option><option value="advanced">Продвинутый</option></select></label>
+        <label>Подробность<select id="profile-detail"><option value="low">Кратко</option><option value="medium">Средне</option><option value="high">Подробно</option></select></label>
+        <label>Тон<select id="profile-tone"><option value="neutral">Нейтральный</option><option value="friendly">Дружелюбный</option><option value="formal">Формальный</option></select></label>
+      </div>
+      <label>Структура ответа<select id="profile-structure"><option value="result_then_explanation">Сначала результат, затем объяснение</option><option value="step_by_step">Пошагово</option><option value="free">Свободная</option></select></label>
+      <label>Предпочтительные форматы <small>(через запятую)</small><input id="profile-preferred-formats" maxlength="500" placeholder="steps, examples"></label>
+      <label>Нежелательные форматы <small>(через запятую)</small><input id="profile-avoid-formats" maxlength="500" placeholder="excessive_headings"></label>
+      <label>Дополнительные инструкции<textarea id="profile-instructions" maxlength="2000" rows="4"></textarea></label>
+      <p id="profile-error" class="error-text"></p>
+      <div class="dialog-actions"><button class="secondary" value="cancel">Отмена</button><button id="profile-save" class="primary" type="button">Сохранить</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="project-share-dialog" aria-labelledby="project-share-title">
+    <div class="dialog-card share-card">
+      <div class="panel-heading"><div><small>ДОСТУП К ПРОЕКТУ</small><h2 id="project-share-title">Участники проекта</h2></div><button id="project-share-close" class="icon-button" type="button" aria-label="Закрыть">×</button></div>
+      <p id="project-share-owner" class="share-owner"></p>
+      <div id="project-share-list" class="share-list"></div>
+      <p id="project-share-error" class="error-text"></p>
+      <div class="dialog-actions"><button id="project-share-save" class="primary" type="button">Сохранить доступ</button></div>
+    </div>
+  </dialog>
+
+  <dialog id="facts-help-dialog" aria-labelledby="facts-help-title">
+    <form method="dialog" class="dialog-card facts-help-card">
+      <div class="panel-heading"><div><small>СПРАВКА</small><h2 id="facts-help-title">Как добавить Sticky Fact</h2></div><button class="icon-button" value="cancel" aria-label="Закрыть справку">×</button></div>
+      <div class="facts-help-content">
+        <section>
+          <h3>1. Ключ</h3>
+          <p>Ключ записывается по схеме <code>категория.название</code>. Сначала выберите одну из разрешённых английских категорий, поставьте точку и добавьте понятное имя факта.</p>
+          <div class="fact-example good"><strong>Правильно</strong><code>goal.primary</code><code>preferences.language</code><code>constraints.budget</code></div>
+          <div class="fact-example bad"><strong>Неправильно</strong><code>primary</code><code>goal primary</code><code>цель.primary</code></div>
+          <p class="help-note">Регистр исправляется автоматически, пробелы заменяются на <code>_</code>. Но точка и допустимая категория перед ней обязательны. Два факта с одинаковым ключом добавить нельзя.</p>
+        </section>
+        <section>
+          <h3>Разрешённые категории</h3>
+          <dl class="fact-categories">
+            <div><dt><code>goal</code></dt><dd>цели</dd></div>
+            <div><dt><code>context</code></dt><dd>контекст и фон задачи</dd></div>
+            <div><dt><code>entities</code></dt><dd>люди, организации и объекты</dd></div>
+            <div><dt><code>requirements</code></dt><dd>обязательные требования</dd></div>
+            <div><dt><code>constraints</code></dt><dd>ограничения</dd></div>
+            <div><dt><code>preferences</code></dt><dd>предпочтения пользователя</dd></div>
+            <div><dt><code>decisions</code></dt><dd>принятые решения</dd></div>
+            <div><dt><code>agreements</code></dt><dd>договорённости</dd></div>
+            <div><dt><code>resources</code></dt><dd>файлы, ссылки и другие ресурсы</dd></div>
+            <div><dt><code>environment</code></dt><dd>ОС, оборудование и окружение</dd></div>
+            <div><dt><code>numbers</code></dt><dd>важные числа и суммы</dd></div>
+            <div><dt><code>deadlines</code></dt><dd>сроки и даты</dd></div>
+            <div><dt><code>definitions</code></dt><dd>термины и их значения</dd></div>
+            <div><dt><code>output</code></dt><dd>требуемый формат результата</dd></div>
+            <div><dt><code>open_questions</code></dt><dd>нерешённые вопросы</dd></div>
+            <div><dt><code>next_steps</code></dt><dd>следующие действия</dd></div>
+            <div><dt><code>risks</code></dt><dd>риски и опасения</dd></div>
+          </dl>
+        </section>
+        <section>
+          <h3>2. Значение</h3>
+          <p>В поле «Значение» напишите сам факт обычным текстом — без JSON, кавычек и знака равенства. Лучше сохранять одну конкретную и устойчивую мысль.</p>
+          <div class="fact-example good"><strong>Пример</strong><code>Ключ: preferences.language</code><span>Значение: Отвечать на русском языке</span></div>
+          <p class="help-note">Ключ — не более 120 символов, значение — не более 2000. Кнопка «Добавить и закрепить» защищает ручную запись от автоматического изменения.</p>
+        </section>
+      </div>
+      <div class="dialog-actions facts-help-actions"><button class="primary" value="close">Понятно</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="memory-dialog" class="memory-dialog" aria-labelledby="memory-title">
+    <div class="dialog-card memory-card">
+      <div class="panel-heading"><div><small>ДЕНЬ 11</small><h2 id="memory-title">Память ассистента</h2></div><button id="memory-close" class="icon-button" type="button" aria-label="Закрыть">×</button></div>
+      <div class="memory-tabs" role="tablist">
+        <button class="memory-tab active" data-tab="conversation" type="button">Текущий диалог</button>
+        <button class="memory-tab" data-tab="project" type="button">Проект</button>
+        <button class="memory-tab" data-tab="user" type="button">Пользователь</button>
+        <button class="memory-tab" data-tab="policy" type="button">Политика</button>
+      </div>
+      <div class="memory-content">
+        <section class="memory-pane active" data-pane="conversation">
+          <p>Краткосрочная память управляет только тем, какая часть текущего диалога попадает в очередной запрос. Она не заменяет проектную и пользовательскую память.</p>
+          <div id="memory-conversation-summary"></div>
+        </section>
+        <section class="memory-pane" data-pane="project">
+          <div class="memory-project-controls">
+            <label>Проект текущего диалога<select id="memory-project-select"><option value="">Без проекта</option></select></label>
+            <button id="memory-new-project" class="secondary" type="button">Создать проект</button>
+          </div>
+          <div id="memory-project-editor" hidden>
+            <div class="two-columns"><label>Название<input id="memory-project-name" maxlength="120"></label><label>Описание<input id="memory-project-description" maxlength="2000"></label></div>
+            <div class="memory-inline"><label class="toggle-row"><span><strong>Автоизвлечение</strong><small>Включено по умолчанию; выполняется после успешного ответа</small></span><input id="memory-project-auto" type="checkbox"></label><button id="memory-save-project" class="secondary" type="button">Сохранить проект</button></div>
+            <div><strong>Связанные диалоги</strong><div id="memory-project-conversations" class="memory-linked"></div></div>
+          </div>
+          <form id="memory-project-form" class="memory-form" hidden><select name="kind"></select><input name="key" maxlength="120" placeholder="backend.framework" required><textarea name="value" maxlength="2000" rows="2" placeholder="Значение" required></textarea><button class="primary" type="submit">Добавить ручную запись</button></form>
+          <div id="memory-project-list"></div>
+        </section>
+        <section class="memory-pane" data-pane="user">
+          <label class="toggle-row"><span><strong>Автоизвлечение долговременной памяти профиля</strong><small>У новых профилей включено. Записи сохраняются только для автора сообщения.</small></span><input id="memory-user-auto" type="checkbox"></label>
+          <form id="memory-user-form" class="memory-form"><select name="kind"></select><input name="key" maxlength="120" placeholder="preference.language" required><textarea name="value" maxlength="2000" rows="2" placeholder="Значение" required></textarea><button class="primary" type="submit">Добавить ручную запись</button></form>
+          <div id="memory-user-list"></div>
+        </section>
+        <section class="memory-pane" data-pane="policy">
+          <p>Эти правила задаются разработчиками и не изменяются моделью.</p>
+          <ol id="memory-policy-list" class="policy-list"></ol>
+        </section>
+      </div>
+      <p id="memory-error" class="error-text memory-error"></p>
+    </div>
+  </dialog>
+
+  <dialog id="memory-snapshot-dialog" aria-labelledby="memory-snapshot-title">
+    <div class="dialog-card snapshot-card"><div class="panel-heading"><div><small>АУДИТ ЗАПРОСА</small><h2 id="memory-snapshot-title">Какая память использована</h2></div><button id="memory-snapshot-close" class="icon-button" type="button">×</button></div><div id="memory-snapshot-content" class="memory-content"></div></div>
+  </dialog>
+
   <template id="message-template">
-    <article class="message"><div class="message-avatar"></div><div class="message-body"><header><strong></strong><time></time></header><div class="message-text"></div><div class="message-actions"><button class="fork-button" type="button">Разветвить</button><div class="branch-switch" hidden><button class="branch-prev" type="button" aria-label="Предыдущая ветка">‹</button><span></span><button class="branch-next" type="button" aria-label="Следующая ветка">›</button></div></div><div class="token-strip" hidden></div><details class="reasoning" hidden><summary>Ход рассуждений</summary><div></div></details><details class="technical"><summary>Техническая информация</summary><pre></pre></details></div></article>
+    <article class="message"><div class="message-avatar"></div><div class="message-body"><header><strong></strong><time></time></header><div class="message-text"></div><div class="message-actions"><button class="fork-button" type="button">Разветвить</button><button class="policy-retry-button" type="button" hidden>Сгенерировать заново</button><button class="memory-used-button" type="button" hidden>Какая память использована</button><div class="branch-switch" hidden><button class="branch-prev" type="button" aria-label="Предыдущая ветка">‹</button><span></span><button class="branch-next" type="button" aria-label="Следующая ветка">›</button></div></div><div class="token-strip" hidden></div><details class="reasoning" hidden><summary>Ход рассуждений</summary><div></div></details><details class="technical"><summary>Техническая информация</summary><pre></pre></details></div></article>
   </template>
-  <script src="{{ url_for('static', filename='app.js', v='20260912-10') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='20260920-artifacts-1') }}"></script>
 </body>
 </html>

@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, Protocol
 
+
+logger = logging.getLogger("deepseek_agent.provider")
+
 from openai import OpenAI
+
+from task_state import EVENT_LABELS, allowed_task_events
 
 
 DEEPSEEK_MODELS = (
@@ -16,10 +22,16 @@ DEEPSEEK_MODELS = (
     "deepseek-v4-pro",
 )
 
+DEEPSEEK_CONTEXT_WINDOWS = {
+    "deepseek-v4-flash": 1_000_000,
+    "deepseek-v4-pro": 1_000_000,
+}
+
 
 PROVIDER_CAPABILITIES: dict[str, Any] = {
     "provider": "deepseek",
     "models": list(DEEPSEEK_MODELS),
+    "context_windows": DEEPSEEK_CONTEXT_WINDOWS,
     "controls": {
         "system_prompt": {"type": "text", "max_length": 20_000},
         "temperature": {"type": "number", "min": 0, "max": 2, "step": 0.01},
@@ -165,7 +177,20 @@ class DeepSeekProvider:
             request_args["top_logprobs"] = settings.top_logprobs
 
         started = time.perf_counter()
-        response = self._get_client().chat.completions.create(**request_args)
+        logger.info(
+            "DeepSeek-запрос начат | model=%s | messages=%s | chars=%s | reasoning=%s | format=%s",
+            settings.model, len(messages),
+            sum(len(str(item.get("content", ""))) for item in messages),
+            settings.reasoning_enabled, settings.response_format,
+        )
+        try:
+            response = self._get_client().chat.completions.create(**request_args)
+        except Exception:
+            logger.exception(
+                "DeepSeek-запрос завершился ошибкой | model=%s | elapsed=%.3f",
+                settings.model, time.perf_counter() - started,
+            )
+            raise
         elapsed = time.perf_counter() - started
         choice = response.choices[0]
         message = choice.message
@@ -189,6 +214,12 @@ class DeepSeekProvider:
             },
             "settings": settings.to_dict(),
         }
+        logger.info(
+            "DeepSeek-запрос завершён | request_id=%s | model=%s | finish=%s | elapsed=%.3f | input=%s | output=%s | total=%s",
+            technical["request_id"], technical["model"], technical["finish_reason"], elapsed,
+            technical["usage"]["input_tokens"], technical["usage"]["output_tokens"],
+            technical["usage"]["total_tokens"],
+        )
         return AgentResult(
             content=getattr(message, "content", None) or "(Модель не вернула текст ответа)",
             reasoning_content=getattr(message, "reasoning_content", None) or "",
@@ -209,8 +240,49 @@ class Agent:
         settings: AgentSettings,
         summary: str = "",
         facts: list[dict[str, str]] | None = None,
+        memory_context: dict[str, Any] | None = None,
+        task_handoff_context: dict[str, Any] | None = None,
+        task_state: dict[str, Any] | None = None,
+        policy_guidance: str = "",
     ) -> AgentResult:
         system_prompt = settings.system_prompt
+        if memory_context:
+            policy_lines = "\n".join(
+                f"- {item.get('text', '')}" for item in memory_context.get("policy_rules", [])
+                if isinstance(item, dict) and item.get("text")
+            )
+            if policy_lines:
+                system_prompt += f"\n\nПОСТОЯННАЯ ПОЛИТИКА АГЕНТА:\n{policy_lines}"
+            profile = memory_context.get("profile_snapshot") or {}
+            preferences = profile.get("preferences") or {}
+            if profile:
+                profile_lines = [
+                    f"Имя: {profile.get('profile_name', 'Пользователь')}",
+                    f"Язык: {preferences.get('language', 'auto')}",
+                    f"Подробность: {preferences.get('detail_level', 'medium')}",
+                    f"Тон: {preferences.get('tone', 'neutral')}",
+                    f"Структура: {preferences.get('response_structure', 'free')}",
+                    f"Технический уровень: {preferences.get('technical_level', 'intermediate')}",
+                ]
+                if preferences.get("preferred_formats"):
+                    profile_lines.append("Предпочтительные форматы: " + ", ".join(preferences["preferred_formats"]))
+                if preferences.get("avoid_formats"):
+                    profile_lines.append("Нежелательные форматы: " + ", ".join(preferences["avoid_formats"]))
+                if profile.get("custom_instructions"):
+                    profile_lines.append("Дополнительные инструкции: " + str(profile["custom_instructions"]))
+                system_prompt += "\n\nАКТИВНЫЙ ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ:\n" + "\n".join(profile_lines)
+            # Порядок блоков соответствует архитектуре: пользователь, затем более
+            # конкретная память проекта. Внутри списков manual уже стоит раньше learned.
+            for title, key in (
+                ("ДОЛГОВРЕМЕННАЯ ПАМЯТЬ ПОЛЬЗОВАТЕЛЯ", "user_memories"),
+                ("РАБОЧАЯ ПАМЯТЬ ПРОЕКТА", "project_memories"),
+            ):
+                lines = []
+                for item in memory_context.get(key, []):
+                    marker = "подтверждено" if item.get("review_status") == "confirmed" else "не подтверждено"
+                    lines.append(f"- [{marker}] {item.get('kind')}.{item.get('key')}: {item.get('value')}")
+                if lines:
+                    system_prompt += f"\n\n{title}:\n" + "\n".join(lines)
         if summary:
             system_prompt += (
                 "\n\nСЖАТАЯ ПАМЯТЬ ПРЕДЫДУЩЕГО ДИАЛОГА:\n"
@@ -225,6 +297,71 @@ class Agent:
                 "Считай эти пары ключ-значение устойчивой памятью. "
                 "Более новые сообщения пользователя имеют приоритет при явном противоречии."
             )
+        if task_handoff_context and task_handoff_context.get("handoffs"):
+            handoff_blocks = []
+            labels = {
+                "approved_plan": "Утверждённый план",
+                "decisions": "Решения",
+                "constraints": "Ограничения",
+                "acceptance_criteria": "Критерии готовности",
+                "completed_work": "Выполненная работа",
+                "validation_findings": "Результаты проверки",
+                "open_questions": "Открытые вопросы",
+            }
+            for handoff in task_handoff_context["handoffs"]:
+                lines = [
+                    f"Передача {handoff.get('source_stage', '?')} → {handoff.get('target_stage', '?')}",
+                    f"Итог: {handoff.get('summary', '')}",
+                ]
+                for key, label in labels.items():
+                    values = handoff.get(key, [])
+                    if values:
+                        lines.append(f"{label}: " + " | ".join(str(item) for item in values))
+                handoff_blocks.append("\n".join(lines))
+            system_prompt += (
+                "\n\nАВТОРИТЕТНЫЙ HANDOFF ТЕКУЩЕГО ЭТАПА:\n"
+                + "\n\n".join(handoff_blocks)
+                + "\n\nЭто структурированный результат предыдущих этапов. Используй его вместо "
+                "восстановления плана или решений из старой переписки."
+            )
+        # Task State добавляется последним: это текущее явно заданное состояние,
+        # а упоминания этапов в памяти, summary, facts и истории могут быть устаревшими.
+        if task_state:
+            stage_labels = {
+                "planning": "Планирование",
+                "execution": "Выполнение",
+                "validation": "Проверка",
+                "done": "Завершено",
+            }
+            stage = str(task_state.get("stage") or "planning")
+            allowed_events = allowed_task_events(task_state)
+            allowed_text = ", ".join(
+                f"{event} ({EVENT_LABELS[event]})" for event in allowed_events
+            ) or "нет — жизненный цикл завершён"
+            system_prompt += (
+                "\n\nАВТОРИТЕТНОЕ СОСТОЯНИЕ ТЕКУЩЕЙ ЗАДАЧИ:\n"
+                f"Описание: {task_state.get('description') or 'не задано'}\n"
+                f"Код этапа: {stage}\n"
+                f"Название этапа: {stage_labels.get(stage, stage)}\n"
+                f"Текущий шаг: {task_state.get('current_step') or 'не задан'}\n"
+                f"Ожидаемое действие: {task_state.get('expected_action') or 'не задано'}\n"
+                f"Краткий план: {task_state.get('plan') or 'не задан'}\n"
+                f"Обязательные артефакты: {', '.join(task_state.get('required_artifacts', [])) or 'нет'}\n"
+                f"Зарегистрированные артефакты: {json.dumps(task_state.get('registered_artifacts', []), ensure_ascii=False)}\n"
+                f"Активность: {task_state.get('activity', 'active')}\n"
+                f"Управление переходами: {task_state.get('transition_mode', 'manual')}\n\n"
+                f"Разрешённые сервером события: {allowed_text}\n\n"
+                "ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА СОСТОЯНИЯ:\n"
+                "- Эти значения явно установлены пользователем и являются единственным источником истины о текущем состоянии.\n"
+                "- Не определяй и не переопределяй текущий этап по смыслу истории, плану, выполненной работе или собственным выводам.\n"
+                "- Упоминания других этапов в памяти, summary, facts и истории считай устаревшими историческими сведениями.\n"
+                f"- Если пользователь спрашивает текущий этап, отвечай точным значением: {stage}.\n"
+                "- Не утверждай, что этап изменился, пока серверное событие перехода не выполнено.\n"
+                "- Если пользователь просит перепрыгнуть этап, объясни, какое разрешённое действие требуется сначала.\n"
+                "- Ты читаешь состояние, но не изменяешь его: переходы выполняет только серверный автомат."
+            )
+        if policy_guidance:
+            system_prompt += policy_guidance
         messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
         for item in history:
             role = item.get("role")
@@ -235,7 +372,148 @@ class Agent:
             if role in {"user", "assistant"} and isinstance(content, str) and content:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
-        return self.provider.complete(messages, settings)
+        request_settings = replace(settings, response_format="text") if policy_guidance else settings
+        return self.provider.complete(messages, request_settings)
+
+    def validate_task_response(self, prompt: str, settings: AgentSettings) -> AgentResult:
+        """Вторым независимым JSON-вызовом проверяет фактическое действие черновика."""
+        validator_settings = AgentSettings(
+            model=settings.model,
+            system_prompt="Ты строгий контроллер этапов задачи и инвариантов. Проверяй содержание, а не метки автора.",
+            temperature=0,
+            top_p=1,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=1_500,
+            response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": validator_settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], validator_settings)
+
+    def extract_stage_handoff(
+        self,
+        *,
+        source_stage: str,
+        target_stage: str,
+        event: str,
+        task_state: dict[str, Any],
+        previous_handoffs: list[dict[str, Any]],
+        exchanges: list[dict[str, Any]],
+        max_transcript_chars: int,
+    ) -> AgentResult:
+        """Сворачивает завершённое посещение этапа в структурированный контракт следующего."""
+        transcript = []
+        for exchange in exchanges:
+            for message in exchange.get("messages", []):
+                role = "Пользователь" if message.get("role") == "user" else "Ассистент"
+                transcript.append(f"{role}: {message.get('content', '')}")
+        joined = "\n\n".join(transcript)
+        if len(joined) > max_transcript_chars:
+            half = max_transcript_chars // 2
+            joined = joined[:half] + "\n\n[середина длинного этапа опущена]\n\n" + joined[-half:]
+        previous = [
+            {
+                key: item.get(key)
+                for key in ("source_stage", "target_stage", "summary", "approved_plan", "decisions", "constraints", "acceptance_criteria", "completed_work", "validation_findings", "open_questions")
+            }
+            for item in previous_handoffs
+        ]
+        state_payload = {
+            key: task_state.get(key)
+            for key in ("description", "stage", "current_step", "expected_action", "plan", "stage_run_id", "required_artifacts")
+        }
+        prompt = (
+            f"Сверни завершённое посещение этапа {source_stage} перед переходом в {target_stage}. "
+            "Это контракт для следующего этапа, а не пересказ беседы. Не добавляй домыслов. "
+            "Сохрани принятый план, решения, ограничения, критерии готовности, фактически выполненную работу, "
+            "результаты проверки и открытые вопросы. Верни только JSON с полями: summary (строка), "
+            "approved_plan, decisions, constraints, acceptance_criteria, completed_work, validation_findings, "
+            "open_questions (массивы строк).\n\n"
+            f"Событие перехода: {event}\n"
+            f"Авторитетное состояние задачи:\n{json.dumps(state_payload, ensure_ascii=False)}\n\n"
+            f"Активные handoff предыдущих этапов:\n{json.dumps(previous, ensure_ascii=False)}\n\n"
+            f"Успешная история завершаемого этапа:\n{joined}"
+        )
+        settings = AgentSettings(
+            model="deepseek-v4-flash",
+            system_prompt="Ты формируешь структурированный handoff между этапами задачи.",
+            temperature=0.1,
+            top_p=1.0,
+            reasoning_enabled=False,
+            reasoning_effort="low",
+            max_tokens=3_000,
+            response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], settings)
+
+    def extract_memories(
+        self, user_text: str, assistant_text: str, *, allow_project: bool, allow_user: bool
+    ) -> AgentResult:
+        """Одним строгим JSON-вызовом извлекает кандидатов обоих разрешённых scope."""
+        scopes = []
+        if allow_project:
+            scopes.append("project")
+        if allow_user:
+            scopes.append("user")
+        prompt = (
+            "Извлеки до 12 устойчивых записей памяти из успешного обмена. "
+            f"Разрешённые scope: {', '.join(scopes)}. "
+            "Для user сохраняй только долговременные сведения о пользователе, полезные вне проекта. "
+            "Не сохраняй секреты, пароли, ключи, временные задачи, tool chatter и случайные имена файлов. "
+            "Для project сохраняй цели, решения, требования, ограничения, окружение, ресурсы, результаты и риски. "
+            "Тип kind выбирай только из: goal, context, preference, decision, requirement, constraint, "
+            "resource, environment, definition, open_question, result, risk. "
+            "Верни только JSON вида {\"memories\":[{\"scope\":\"project\",\"kind\":\"decision\","
+            "\"key\":\"storage.format\",\"value\":\"Локальные JSON-файлы\",\"confidence\":\"high\"}]}.\n\n"
+            f"Пользователь:\n{user_text}\n\nАссистент:\n{assistant_text}"
+        )
+        settings = AgentSettings(
+            model="deepseek-v4-flash", system_prompt="Ты извлекаешь безопасную структурированную память.",
+            temperature=0.1, reasoning_enabled=False, reasoning_effort="low",
+            max_tokens=2_000, response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], settings)
+
+    def extract_project_memories_from_history(self, messages: list[dict[str, Any]]) -> AgentResult:
+        """Извлекает проектную память из успешной истории по явному действию пользователя."""
+        transcript = []
+        for message in messages:
+            role = message.get("role")
+            content = message.get("content")
+            if role not in {"user", "assistant"} or not isinstance(content, str) or not content:
+                continue
+            label = "Пользователь" if role == "user" else "Ассистент"
+            transcript.append(f"{label}: {content}")
+        if not transcript:
+            raise ValueError("В диалоге нет успешной истории для извлечения памяти.")
+        prompt = (
+            "Извлеки до 12 актуальных записей рабочей памяти проекта из истории диалога. "
+            "Сохраняй цели, решения, требования, ограничения, окружение, ресурсы, результаты, "
+            "термины, открытые вопросы и риски. Не сохраняй секреты, пароли, API-ключи, "
+            "tool chatter и устаревшие промежуточные детали. Тип kind выбирай только из: goal, context, "
+            "preference, decision, requirement, constraint, resource, environment, definition, open_question, result, risk. "
+            "Верни только JSON вида "
+            '{"memories":[{"scope":"project","kind":"decision","key":"storage.format",'
+            '"value":"Локальные JSON-файлы","confidence":"high"}]}.\n\n'
+            "Успешная история активной ветки:\n" + "\n\n".join(transcript)
+        )
+        settings = AgentSettings(
+            model="deepseek-v4-flash", system_prompt="Ты извлекаешь безопасную рабочую память проекта.",
+            temperature=0.1, reasoning_enabled=False, reasoning_effort="low",
+            max_tokens=2_000, response_format="json_object",
+        )
+        return self.provider.complete([
+            {"role": "system", "content": settings.system_prompt},
+            {"role": "user", "content": prompt},
+        ], settings)
 
     def extract_facts(self, current_facts: list[dict[str, Any]], user_text: str) -> AgentResult:
         """Возвращает обновлённую key-value память в строгом JSON."""
