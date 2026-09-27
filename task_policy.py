@@ -11,10 +11,10 @@ from task_state import EVENT_LABELS, allowed_task_events
 
 
 STAGE_ACTIONS = {
-    "planning": ("clarification", "analysis", "planning", "request_plan_approval", "refusal"),
-    "execution": ("clarification", "implementation", "progress_report", "request_validation", "request_rollback", "refusal"),
-    "validation": ("clarification", "validation", "defect_report", "validation_result", "refusal"),
-    "done": ("clarification", "final_summary", "result_explanation", "refusal"),
+    "planning": ("clarification", "analysis", "planning", "request_plan_approval", "schedule_management", "file_export", "refusal"),
+    "execution": ("clarification", "implementation", "progress_report", "request_validation", "request_rollback", "schedule_management", "file_export", "refusal"),
+    "validation": ("clarification", "validation", "defect_report", "validation_result", "schedule_management", "file_export", "refusal"),
+    "done": ("clarification", "final_summary", "result_explanation", "schedule_management", "file_export", "refusal"),
 }
 
 ACTION_LABELS = {
@@ -31,6 +31,8 @@ ACTION_LABELS = {
     "validation_result": "результат проверки",
     "final_summary": "итог",
     "result_explanation": "объяснение результата",
+    "schedule_management": "управление расписанием",
+    "file_export": "экспорт результата в локальный файл",
     "refusal": "контролируемый отказ",
 }
 
@@ -97,6 +99,7 @@ def validation_prompt(
     draft: str,
     task_state: dict[str, Any],
     invariant_set: dict[str, Any] | None,
+    performed_actions: list[str] | None = None,
 ) -> str:
     context = policy_context(task_state, invariant_set)
     return (
@@ -108,7 +111,9 @@ def validation_prompt(
         '"violated_invariant_ids":[],"stage_complete":true,"recommended_event":"approve_plan",'
         '"required_artifacts":["index.html"],"explanation":""}. '
         "checked_invariant_ids должен содержать ref каждого переданного активного инварианта. "
-        "allowed=true допустимо только если фактическое действие разрешено этапом и инварианты не нарушены. "
+        "Поле allowed оценивает только допустимость фактического действия на текущем этапе и соблюдение инвариантов. "
+        "Оно не зависит от завершённости этапа: если действие разрешено и нарушений нет, верни allowed=true, "
+        "даже когда stage_complete=false и recommended_event=null. "
         "stage_complete=true ставь только когда ответ действительно завершает текущий этап, не оставляет критических "
         "вопросов и позволяет немедленно продолжать работу. Тогда recommended_event должен быть одним из allowed_events. "
         "Если этап не завершён, верни stage_complete=false и recommended_event=null. В done всегда верни false/null.\n\n"
@@ -117,7 +122,17 @@ def validation_prompt(
         "required_artifacts из политики без добавления новых путей.\n\n"
         f"Запрос пользователя:\n{user_text}\n\n"
         f"Черновик ответа:\n{draft}\n\n"
-        f"Политика:\n{json.dumps(context, ensure_ascii=False)}"
+        + (
+            "Подтверждённые сервером MCP-действия в этом ответе: "
+            + ", ".join(performed_actions)
+            + ". Если ответ только сообщает результат Scheduler MCP, классифицируй его как schedule_management. "
+            "Если write_file успешно сохранил подготовленный по запросу отчёт, классифицируй ответ как file_export; "
+            "это самостоятельный экспорт, а не артефакт жизненного цикла задачи, поэтому на planning оставь "
+            "required_artifacts пустым, stage_complete=false и recommended_event=null. "
+            "Если в тексте есть отдельное действие другого типа, классифицируй по фактическому содержанию.\n\n"
+            if performed_actions else ""
+        )
+        + f"Политика:\n{json.dumps(context, ensure_ascii=False)}"
     )
 
 
@@ -160,9 +175,14 @@ def parse_validation_result(content: str, task_state: dict[str, Any], invariant_
         expected = normalize_required_artifacts(task_state.get("required_artifacts", []))
         if required_artifacts != expected:
             raise PolicyValidationError("Проверяющая модель самовольно изменила список обязательных артефактов.")
+    # Сервер сам принимает окончательное решение по нормализованному типу
+    # действия и ссылкам на инварианты. Флаг allowed от вероятностного
+    # валидатора сохраняется для аудита, но не может запретить разрешённый
+    # промежуточный ответ только потому, что stage_complete=false.
     server_allowed = action in context["allowed_action_types"] and not violations and not unknown_violations
     return {
-        "allowed": bool(allowed and server_allowed),
+        "allowed": server_allowed,
+        "validator_allowed": allowed,
         "detected_action_type": action,
         "checked_invariant_ids": checked,
         "violated_invariant_ids": violations,
@@ -200,6 +220,7 @@ def policy_audit(
         "stage": task_state.get("stage"),
         "transition_mode": task_state.get("transition_mode"),
         "detected_action_type": (validation or {}).get("detected_action_type"),
+        "validator_allowed": (validation or {}).get("validator_allowed"),
         "stage_complete": bool((validation or {}).get("stage_complete")),
         "recommended_event": (validation or {}).get("recommended_event"),
         "required_artifacts": list((validation or {}).get("required_artifacts", [])),

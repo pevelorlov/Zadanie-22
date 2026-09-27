@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="Локальный многодиалоговый агент DeepSeek">
   <title>DeepSeek Agent</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260920-artifacts-1') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css', v='20260927-day20-1') }}">
 </head>
 <body>
   <div class="app-shell">
@@ -29,6 +29,9 @@
       <nav id="conversation-list" class="conversation-list" aria-label="Диалоги"></nav>
       <p id="sidebar-project-status" class="sidebar-project-status" role="status"></p>
       <div class="sidebar-footer">
+        <button id="scheduler-button" class="secondary wide scheduler-menu-button" type="button">
+          Расписание <span id="scheduler-badge" class="notification-badge" hidden>0</span>
+        </button>
         <button id="presets-button" class="secondary wide" type="button">Управление пресетами</button>
         <small>Ключ хранится только в .env</small>
       </div>
@@ -82,6 +85,66 @@
         <span id="context-status" class="context-status">Полная история</span>
       </div>
       <div class="context-scroll">
+        <section class="mcp-card" aria-labelledby="mediawiki-mcp-title">
+          <div class="section-title">
+            <div><small>ДЕНЬ 20</small><h3 id="mediawiki-mcp-title">MediaWiki MCP</h3></div>
+            <span id="mediawiki-mcp-status" class="mcp-status stopped">Остановлен</span>
+          </div>
+          <small>ProfessionalWiki MCP: анонимный поиск и чтение русской Wikipedia. Модели доступен только read-only набор.</small>
+          <div class="mcp-actions">
+            <button id="mediawiki-mcp-start" class="primary" type="button">Запустить MCP</button>
+            <button id="mediawiki-mcp-tools" class="secondary" type="button" disabled>Получить инструменты</button>
+            <button id="mediawiki-mcp-stop" class="danger" type="button" disabled>Остановить MCP</button>
+          </div>
+          <p id="mediawiki-mcp-message" class="mcp-message" role="status">MCP-сервер не запущен.</p>
+          <dl id="mediawiki-mcp-details" class="mcp-details" hidden></dl>
+          <div id="mediawiki-mcp-tool-list" class="mcp-tool-list"></div>
+        </section>
+        <section class="mcp-card" aria-labelledby="worldbank-mcp-title">
+          <div class="section-title">
+            <div><small>ДЕНЬ 20</small><h3 id="worldbank-mcp-title">World Bank MCP</h3></div>
+            <span id="worldbank-mcp-status" class="mcp-status stopped">Остановлен</span>
+          </div>
+          <small>Публичные показатели, страны, бедность и проекты Всемирного банка. API-ключ не требуется.</small>
+          <div class="mcp-actions">
+            <button id="worldbank-mcp-start" class="primary" type="button">Запустить MCP</button>
+            <button id="worldbank-mcp-tools" class="secondary" type="button" disabled>Получить инструменты</button>
+            <button id="worldbank-mcp-stop" class="danger" type="button" disabled>Остановить MCP</button>
+          </div>
+          <p id="worldbank-mcp-message" class="mcp-message" role="status">MCP-сервер не запущен.</p>
+          <dl id="worldbank-mcp-details" class="mcp-details" hidden></dl>
+          <div id="worldbank-mcp-tool-list" class="mcp-tool-list"></div>
+        </section>
+        <section class="mcp-card" aria-labelledby="weather-mcp-title">
+          <div class="section-title">
+            <div><small>ДЕНЬ 17</small><h3 id="weather-mcp-title">Open‑Meteo MCP</h3></div>
+            <span id="weather-mcp-status" class="mcp-status stopped">Остановлен</span>
+          </div>
+          <small>Пять погодных инструментов передаются DeepSeek. После запуска можно спросить в чате о погоде и подходящей одежде.</small>
+          <div class="mcp-actions">
+            <button id="weather-mcp-start" class="primary" type="button">Запустить MCP</button>
+            <button id="weather-mcp-tools" class="secondary" type="button" disabled>Получить инструменты</button>
+            <button id="weather-mcp-stop" class="danger" type="button" disabled>Остановить MCP</button>
+          </div>
+          <p id="weather-mcp-message" class="mcp-message" role="status">MCP-сервер не запущен.</p>
+          <dl id="weather-mcp-details" class="mcp-details" hidden></dl>
+          <div id="weather-mcp-tool-list" class="mcp-tool-list"></div>
+        </section>
+        <section class="mcp-card" aria-labelledby="mcp-title">
+          <div class="section-title">
+            <div><small>ДЕНЬ 16</small><h3 id="mcp-title">Filesystem MCP</h3></div>
+            <span id="mcp-status" class="mcp-status stopped">Остановлен</span>
+          </div>
+          <small>Сервер видит только папку проекта <code>workspace</code>. При явной просьбе сохранить отчёт он запускается автоматически и передаёт модели только безопасный <code>write_file</code> для <code>workspace/reports</code>.</small>
+          <div class="mcp-actions">
+            <button id="mcp-start" class="primary" type="button">Запустить MCP</button>
+            <button id="mcp-tools" class="secondary" type="button" disabled>Получить инструменты</button>
+            <button id="mcp-stop" class="danger" type="button" disabled>Остановить MCP</button>
+          </div>
+          <p id="mcp-message" class="mcp-message" role="status">MCP-сервер не запущен.</p>
+          <dl id="mcp-details" class="mcp-details" hidden></dl>
+          <div id="mcp-tool-list" class="mcp-tool-list"></div>
+        </section>
         <section class="task-state-card" aria-labelledby="task-state-title">
           <div class="section-title">
             <div><small>ДЕНЬ 15</small><h3 id="task-state-title">Контролируемый жизненный цикл</h3></div>
@@ -369,9 +432,70 @@
     <div class="dialog-card snapshot-card"><div class="panel-heading"><div><small>АУДИТ ЗАПРОСА</small><h2 id="memory-snapshot-title">Какая память использована</h2></div><button id="memory-snapshot-close" class="icon-button" type="button">×</button></div><div id="memory-snapshot-content" class="memory-content"></div></div>
   </dialog>
 
+  <dialog id="scheduler-dialog" class="scheduler-dialog" aria-labelledby="scheduler-title">
+    <div class="dialog-card scheduler-card">
+      <div class="panel-heading">
+        <div><small>ДЕНЬ 18 · ASIA/NOVOSIBIRSK</small><h2 id="scheduler-title">Расписание и автоматизации</h2></div>
+        <div class="scheduler-heading-actions">
+          <span id="scheduler-runtime-status" class="mcp-status stopped">Остановлен</span>
+          <button id="scheduler-close" class="icon-button" type="button" aria-label="Закрыть">×</button>
+        </div>
+      </div>
+      <div class="scheduler-layout">
+        <section class="scheduler-editor">
+          <div class="section-title"><strong id="scheduler-editor-title">Новое задание</strong><small>DeepSeek вызывается автоматически</small></div>
+          <input id="scheduler-edit-id" type="hidden">
+          <label>Название<input id="scheduler-task-title" maxlength="160" placeholder="Утренняя погода"></label>
+          <label>Промпт<textarea id="scheduler-task-prompt" maxlength="50000" rows="5" placeholder="Получи погоду в Новосибирске и предложи одежду."></textarea></label>
+          <label>Тип расписания
+            <select id="scheduler-type">
+              <option value="once">Один раз</option>
+              <option value="interval">Периодически</option>
+            </select>
+          </label>
+          <div class="scheduler-time-grid">
+            <label>Первый запуск<input id="scheduler-run-at" type="datetime-local"></label>
+            <label>Или через, минут<input id="scheduler-delay" type="number" min="0.1" step="0.1" placeholder="60"></label>
+            <label id="scheduler-interval-label" hidden>Период, минут<input id="scheduler-interval" type="number" min="5" step="1" value="60"></label>
+          </div>
+          <fieldset class="scheduler-tools">
+            <legend>MCP-зависимости</legend>
+            <label class="toggle-row"><input id="scheduler-use-weather" type="checkbox"><span>Open‑Meteo MCP</span></label>
+            <div id="scheduler-weather-tools" class="scheduler-tool-options" hidden>
+              <label><input type="checkbox" value="find_location"> find_location</label>
+              <label><input type="checkbox" value="get_current_weather"> get_current_weather</label>
+              <label><input type="checkbox" value="get_hourly_forecast"> get_hourly_forecast</label>
+              <label><input type="checkbox" value="get_daily_forecast"> get_daily_forecast</label>
+              <label><input type="checkbox" value="get_precipitation_window"> get_precipitation_window</label>
+            </div>
+          </fieldset>
+          <p class="scheduler-cost-note">Периодические задания выполняют платные запросы DeepSeek. Минимальный период — 5 минут. Пропущенные запуски не догоняются.</p>
+          <p id="scheduler-error" class="form-error" role="alert"></p>
+          <div class="dialog-actions">
+            <button id="scheduler-reset" class="secondary" type="button">Очистить</button>
+            <button id="scheduler-save" class="primary" type="button">Добавить</button>
+          </div>
+        </section>
+        <section class="scheduler-overview">
+          <div id="scheduler-summary" class="scheduler-summary"></div>
+          <div class="scheduler-overview-actions">
+            <button id="scheduler-show-tools" class="secondary" type="button">Инструменты MCP</button>
+            <button id="scheduler-read-all" class="secondary" type="button">Прочитать уведомления</button>
+          </div>
+          <div id="scheduler-mcp-tools" class="scheduler-mcp-tools" hidden></div>
+          <div id="scheduler-task-list" class="scheduler-task-list"></div>
+          <section class="scheduler-runs-section">
+            <div class="section-title"><strong>Последние запуски</strong><small id="scheduler-runs-count">0</small></div>
+            <div id="scheduler-run-list" class="scheduler-run-list"></div>
+          </section>
+        </section>
+      </div>
+    </div>
+  </dialog>
+
   <template id="message-template">
     <article class="message"><div class="message-avatar"></div><div class="message-body"><header><strong></strong><time></time></header><div class="message-text"></div><div class="message-actions"><button class="fork-button" type="button">Разветвить</button><button class="policy-retry-button" type="button" hidden>Сгенерировать заново</button><button class="memory-used-button" type="button" hidden>Какая память использована</button><div class="branch-switch" hidden><button class="branch-prev" type="button" aria-label="Предыдущая ветка">‹</button><span></span><button class="branch-next" type="button" aria-label="Следующая ветка">›</button></div></div><div class="token-strip" hidden></div><details class="reasoning" hidden><summary>Ход рассуждений</summary><div></div></details><details class="technical"><summary>Техническая информация</summary><pre></pre></details></div></article>
   </template>
-  <script src="{{ url_for('static', filename='app.js', v='20260920-artifacts-1') }}"></script>
+  <script src="{{ url_for('static', filename='app.js', v='20260927-day20-1') }}"></script>
 </body>
 </html>

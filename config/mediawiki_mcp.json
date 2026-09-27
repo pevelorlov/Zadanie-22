@@ -1,0 +1,13 @@
+{
+  "defaultWiki": "ru.wikipedia.org",
+  "allowWikiManagement": false,
+  "wikis": {
+    "ru.wikipedia.org": {
+      "sitename": "Русская Википедия",
+      "server": "https://ru.wikipedia.org",
+      "articlepath": "/wiki",
+      "scriptpath": "/w",
+      "readOnly": true
+    }
+  }
+}

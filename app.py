@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import threading
 import time
 import uuid
 from copy import deepcopy
+from contextvars import ContextVar
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -63,7 +66,16 @@ from context_manager import (
 from logging_setup import reset_request_id, set_request_id
 from invariants import InvariantStore
 from memory_manager import MemoryManager
+from mcp_manager import (
+    MCPManager,
+    MediaWikiMCPManager,
+    OpenMeteoMCPManager,
+    SchedulerMCPManager,
+    StdioMCPManager,
+    WorldBankMCPManager,
+)
 from presets import PresetManager
+from scheduler import SchedulerRepository, SchedulerService, TIMEZONE_NAME, scheduler_now
 from storage import JsonStorage, now_iso
 from task_state import (
     TaskTransitionError,
@@ -97,12 +109,71 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 MAX_MESSAGE_LENGTH = 50_000
 logger = logging.getLogger("deepseek_agent.app")
+_profile_override: ContextVar[str | None] = ContextVar("scheduler_profile_override", default=None)
+_automation_run_override: ContextVar[dict[str, Any] | None] = ContextVar("automation_run_override", default=None)
+_scheduled_tool_allowlist: ContextVar[set[str] | None] = ContextVar("scheduled_tool_allowlist", default=None)
+SCHEDULER_MODEL_TOOLS = {
+    "create_scheduled_task", "list_scheduled_tasks", "get_scheduled_task",
+    "get_scheduled_task_runs", "get_scheduler_summary", "get_scheduler_capabilities",
+}
+FILESYSTEM_MODEL_TOOLS = {"write_file"}
+MEDIAWIKI_MODEL_TOOLS = {
+    "search-page", "search-page-by-prefix", "get-page", "get-pages",
+    "get-category-members", "get-site-info",
+}
+WORLDBANK_MODEL_TOOLS = {
+    "worldbank_list_topics", "worldbank_list_sources", "worldbank_list_countries",
+    "worldbank_get_country", "worldbank_search_indicators", "worldbank_get_indicator",
+    "worldbank_get_data", "worldbank_get_poverty", "worldbank_search_projects",
+}
+_FILE_EXPORT_NEGATIONS = (
+    "не сохраняй", "не сохранять", "без сохранения", "не записывай",
+    "не записывать", "не создавай файл", "не создавай отчёт", "не создавай отчет",
+)
+_FILE_EXPORT_PATTERNS = (
+    r"\bсохран\w*\b", r"\bвыгруз\w*\b", r"\bэкспорт\w*\b",
+    r"\bзапиш\w*\b.{0,30}\b(?:файл|документ|отч[её]т)\b",
+    r"\bсозда\w*\b.{0,30}\b(?:файл|документ|отч[её]т)\b",
+    r"\b(?:файл|документ|отч[её]т)\b.{0,20}\b(?:на диск|в файл|в документ)\b",
+    r"\b(?:save|write|export)\b.{0,30}\b(?:file|document|report)\b",
+)
+
+
+def requests_file_export(text: str) -> bool:
+    """Распознаёт только явную просьбу создать локальный файловый результат."""
+    lowered = str(text or "").lower().replace("ё", "е")
+    if any(marker.replace("ё", "е") in lowered for marker in _FILE_EXPORT_NEGATIONS):
+        return False
+    return any(re.search(pattern, lowered, flags=re.DOTALL) for pattern in _FILE_EXPORT_PATTERNS)
+
+
+def unique_report_path(workspace: Path, requested_path: Any) -> Path:
+    """Создаёт уникальный Markdown-путь строго внутри workspace/reports."""
+    reports_dir = (workspace.resolve() / "reports").resolve()
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    raw_name = Path(str(requested_path or "weather-report").replace("\\", "/")).name
+    stem = Path(raw_name).stem.strip() or "weather-report"
+    safe_stem = re.sub(r"[^0-9A-Za-zА-Яа-яЁё._-]+", "-", stem).strip(" .-_")[:80]
+    safe_stem = safe_stem or "weather-report"
+    timestamp = scheduler_now().strftime("%Y-%m-%d-%H-%M-%S")
+    candidate = reports_dir / f"{safe_stem}-{timestamp}.md"
+    if candidate.exists():
+        candidate = reports_dir / f"{safe_stem}-{timestamp}-{uuid.uuid4().hex[:8]}.md"
+    return candidate
 
 
 def create_app(
     data_dir: Path | None = None,
     agent_instance: Agent | None = None,
     voice_service: WhisperService | None = None,
+    mcp_manager: MCPManager | None = None,
+    weather_mcp_manager: StdioMCPManager | None = None,
+    scheduler_mcp_manager: StdioMCPManager | None = None,
+    scheduler_service: SchedulerService | None = None,
+    scheduler_autostart: bool = False,
+    mediawiki_mcp_manager: StdioMCPManager | None = None,
+    worldbank_mcp_manager: StdioMCPManager | None = None,
+    orchestration_autostart: bool = False,
 ) -> Flask:
     flask_app = Flask(__name__)
     flask_app.json.ensure_ascii = False
@@ -113,6 +184,18 @@ def create_app(
     memory_manager = MemoryManager(storage, BASE_DIR / "config" / "agent_policy.json")
     invariant_store = InvariantStore(storage.data_dir)
     whisper = voice_service or WhisperService(BASE_DIR, autostart=data_dir is None)
+    mcp = mcp_manager or MCPManager(BASE_DIR)
+    weather_mcp = weather_mcp_manager or OpenMeteoMCPManager(BASE_DIR)
+    scheduler_repository = (
+        scheduler_service.repository if scheduler_service is not None
+        else SchedulerRepository(storage.data_dir / "scheduler.sqlite3")
+    )
+    scheduler_mcp = scheduler_mcp_manager or SchedulerMCPManager(BASE_DIR, scheduler_repository.database_path)
+    mediawiki_mcp = mediawiki_mcp_manager or MediaWikiMCPManager(BASE_DIR)
+    worldbank_mcp = worldbank_mcp_manager or WorldBankMCPManager(BASE_DIR)
+    scheduler = scheduler_service or SchedulerService(scheduler_repository)
+    mcp_activity_lock = threading.RLock()
+    mcp_activities: dict[str, dict[str, Any]] = {}
 
     flask_app.extensions["json_storage"] = storage
     flask_app.extensions["preset_manager"] = preset_manager
@@ -120,10 +203,84 @@ def create_app(
     flask_app.extensions["memory_manager"] = memory_manager
     flask_app.extensions["invariant_store"] = invariant_store
     flask_app.extensions["whisper_service"] = whisper
+    flask_app.extensions["mcp_manager"] = mcp
+    flask_app.extensions["weather_mcp_manager"] = weather_mcp
+    flask_app.extensions["scheduler_mcp_manager"] = scheduler_mcp
+    flask_app.extensions["mediawiki_mcp_manager"] = mediawiki_mcp
+    flask_app.extensions["worldbank_mcp_manager"] = worldbank_mcp
+    flask_app.extensions["scheduler_service"] = scheduler
     logger.info("Flask-приложение создано | data_dir=%s", storage.data_dir)
 
     def current_profile_id() -> str:
-        return storage.active_profile_id()
+        return _profile_override.get() or storage.active_profile_id()
+
+    def begin_mcp_activity(activity_id: str | None) -> str | None:
+        if not activity_id or not re.fullmatch(r"[0-9a-f]{32}", activity_id):
+            return None
+        with mcp_activity_lock:
+            if len(mcp_activities) >= 100:
+                oldest = min(mcp_activities, key=lambda key: mcp_activities[key].get("created_at", ""))
+                mcp_activities.pop(oldest, None)
+            mcp_activities[activity_id] = {
+                "id": activity_id, "phase": "thinking", "created_at": now_iso(), "calls": [],
+            }
+        return activity_id
+
+    def public_tool_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+        safe: dict[str, Any] = {}
+        for key, value in arguments.items():
+            lowered = str(key).lower()
+            if any(marker in lowered for marker in ("content", "password", "secret", "token", "key")):
+                safe[key] = f"<{len(str(value))} символов>" if value is not None else None
+                continue
+            encoded = json.dumps(value, ensure_ascii=False)
+            safe[key] = value if len(encoded) <= 500 else encoded[:497] + "…"
+        return safe
+
+    def set_mcp_activity_phase(activity_id: str | None, phase: str, error: str | None = None) -> None:
+        if not activity_id:
+            return
+        with mcp_activity_lock:
+            activity = mcp_activities.get(activity_id)
+            if activity:
+                activity["phase"] = phase
+                activity["updated_at"] = now_iso()
+                if error:
+                    activity["error"] = error
+
+    def begin_tool_activity(activity_id: str | None, server: str | None, name: str,
+                            arguments: dict[str, Any]) -> int | None:
+        if not activity_id:
+            return None
+        with mcp_activity_lock:
+            activity = mcp_activities.get(activity_id)
+            if not activity:
+                return None
+            call_id = len(activity["calls"]) + 1
+            activity["phase"] = "tools"
+            activity["calls"].append({
+                "id": call_id, "server": server, "name": name,
+                "arguments": public_tool_arguments(arguments), "status": "running",
+                "started_at": now_iso(),
+            })
+            activity["updated_at"] = now_iso()
+            return call_id
+
+    def finish_tool_activity(activity_id: str | None, call_id: int | None, *, is_error: bool,
+                             error: str | None = None) -> None:
+        if not activity_id or call_id is None:
+            return
+        with mcp_activity_lock:
+            activity = mcp_activities.get(activity_id)
+            if not activity:
+                return
+            call = next((item for item in activity["calls"] if item["id"] == call_id), None)
+            if call:
+                call["status"] = "error" if is_error else "completed"
+                call["finished_at"] = now_iso()
+                if error:
+                    call["error"] = error
+            activity["updated_at"] = now_iso()
 
     def invariant_context(conversation: dict[str, Any], profile_id: str) -> dict[str, Any]:
         policy = memory_manager.policy()
@@ -145,26 +302,207 @@ def create_app(
         task_state: dict[str, Any],
         handoff_context: dict[str, Any],
         invariants: dict[str, Any],
+        tool_context: dict[str, Any] | None = None,
     ) -> AgentResult:
         """Генерирует черновик и не выпускает его без независимой проверки политики."""
-        draft_result = chat_agent.reply(
-            history,
-            user_text,
-            settings,
-            summary=summary,
-            facts=facts,
-            memory_context=memory_context,
-            task_handoff_context=handoff_context,
-            task_state=task_state,
-            policy_guidance=generation_guidance(task_state, invariants),
-        )
+        available_tools: list[dict[str, Any]] = []
+        tool_owners: dict[str, str] = {}
+        created_scheduler_tasks: list[tuple[str, str]] = []
+        created_report_paths: list[Path] = []
+        if weather_mcp.status().get("connected"):
+            for tool in weather_mcp.tools_for_model():
+                available_tools.append(tool)
+                tool_owners[tool["name"]] = "open-meteo"
+        if mediawiki_mcp.status().get("connected"):
+            for tool in mediawiki_mcp.tools_for_model():
+                if tool["name"] in MEDIAWIKI_MODEL_TOOLS:
+                    available_tools.append(tool)
+                    tool_owners[tool["name"]] = "mediawiki"
+        if worldbank_mcp.status().get("connected"):
+            for tool in worldbank_mcp.tools_for_model():
+                if tool["name"] in WORLDBANK_MODEL_TOOLS:
+                    available_tools.append(tool)
+                    tool_owners[tool["name"]] = "worldbank"
+        if scheduler_mcp.status().get("connected") and _scheduled_tool_allowlist.get() is None:
+            for tool in scheduler_mcp.tools_for_model():
+                if tool["name"] in SCHEDULER_MODEL_TOOLS:
+                    available_tools.append(tool)
+                    tool_owners[tool["name"]] = "scheduler"
+        allowlist = _scheduled_tool_allowlist.get()
+        file_export_enabled = bool((tool_context or {}).get("enable_file_export")) and allowlist is None
+        if file_export_enabled:
+            if not mcp.status().get("connected"):
+                mcp.start()
+            filesystem_tools = mcp.list_tools().get("tools") or []
+            for tool in filesystem_tools:
+                if tool.get("name") not in FILESYSTEM_MODEL_TOOLS:
+                    continue
+                safe_tool = deepcopy(tool)
+                safe_tool["description"] = (
+                    "Сохранить подготовленный Markdown-отчёт. Инструмент доступен только при явной просьбе "
+                    "пользователя сохранить файл. Передайте полное содержимое отчёта и осмысленное базовое имя; "
+                    "приложение принудительно сохранит новый .md-файл в workspace/reports и добавит дату и время."
+                )
+                schema = deepcopy(safe_tool.get("input_schema") or {})
+                properties = schema.setdefault("properties", {})
+                properties.setdefault("path", {})["description"] = (
+                    "Базовое имя отчёта, например weather-novosibirsk.md. Каталог будет заменён на workspace/reports."
+                )
+                properties.setdefault("content", {})["description"] = "Полное содержимое Markdown-отчёта."
+                schema["required"] = ["path", "content"]
+                safe_tool["input_schema"] = schema
+                available_tools.append(safe_tool)
+                tool_owners[safe_tool["name"]] = "filesystem"
+        if allowlist is not None:
+            available_tools = [tool for tool in available_tools if tool["name"] in allowlist]
+
+        def execute_owned_tool(name: str, arguments: dict[str, Any], owner: str | None) -> dict[str, Any]:
+            if owner == "open-meteo":
+                return weather_mcp.call_tool(name, arguments)
+            if owner == "mediawiki":
+                return mediawiki_mcp.call_tool(name, arguments)
+            if owner == "worldbank":
+                return worldbank_mcp.call_tool(name, arguments)
+            if owner == "filesystem":
+                if name != "write_file" or not file_export_enabled:
+                    raise PermissionError("Запись файлов не разрешена для этого запроса.")
+                content = arguments.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("Для отчёта требуется непустое текстовое содержимое.")
+                if len(content) > 500_000:
+                    raise ValueError("Отчёт превышает допустимый размер 500 000 символов.")
+                workspace_value = mcp.status().get("workspace")
+                if not workspace_value:
+                    raise RuntimeError("Filesystem MCP не сообщил разрешённую рабочую папку.")
+                workspace_path = Path(str(workspace_value)).resolve()
+                report_path = unique_report_path(workspace_path, arguments.get("path"))
+                output = mcp.call_tool(name, {"path": str(report_path), "content": content})
+                if not output.get("is_error"):
+                    created_report_paths.append(report_path)
+                    output["result"] = {
+                        "mcp_result": output.get("result"),
+                        "relative_path": report_path.relative_to(workspace_path).as_posix(),
+                        "absolute_path": str(report_path),
+                    }
+                return output
+            if owner != "scheduler":
+                raise RuntimeError(f"MCP-инструмент {name!r} не принадлежит подключённому серверу.")
+            profile_id = str((tool_context or {}).get("profile_id") or current_profile_id())
+            task_id = str(arguments.get("task_id") or "")
+            if task_id:
+                existing = scheduler_repository.get_task(task_id)
+                if existing.get("owner_profile_id") not in {None, profile_id}:
+                    raise PermissionError("Запланированное задание принадлежит другому профилю.")
+            output = scheduler_mcp.call_tool(name, arguments)
+            if output.get("is_error"):
+                return output
+            if name == "create_scheduled_task":
+                created = output.get("result")
+                if not isinstance(created, dict) or not created.get("id"):
+                    raise RuntimeError("Scheduler MCP не вернул созданное задание.")
+                try:
+                    conversation = storage.create_conversation(
+                        f"Автоматизация · {created.get('title', 'Задание')}",
+                        (tool_context or {}).get("project_id"), profile_id,
+                    )
+                    attached = scheduler_repository.attach_context(
+                        str(created["id"]), owner_profile_id=profile_id,
+                        conversation_id=conversation["id"],
+                        source_conversation_id=(tool_context or {}).get("source_conversation_id"),
+                        project_id=(tool_context or {}).get("project_id"),
+                        settings=(tool_context or {}).get("settings") or {},
+                    )
+                except Exception:
+                    scheduler_repository.delete_task(str(created["id"]))
+                    raise
+                created_scheduler_tasks.append((str(created["id"]), conversation["id"]))
+                output["result"] = attached
+            elif name == "list_scheduled_tasks":
+                tasks = scheduler_repository.list_tasks(profile_id)
+                output["result"] = {"count": len(tasks), "timezone": TIMEZONE_NAME, "tasks": tasks}
+            elif name == "get_scheduler_summary":
+                output["result"] = scheduler_repository.summary(profile_id)
+            return output
+
+        def execute_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+            owner = tool_owners.get(name)
+            activity_id = str((tool_context or {}).get("mcp_activity_id") or "") or None
+            call_id = begin_tool_activity(activity_id, owner, name, arguments)
+            try:
+                output = execute_owned_tool(name, arguments, owner)
+                output["mcp_server"] = owner
+                finish_tool_activity(activity_id, call_id, is_error=bool(output.get("is_error")))
+                return output
+            except Exception as error:
+                finish_tool_activity(activity_id, call_id, is_error=True, error=str(error))
+                raise
+
+        def rollback_created_schedules() -> None:
+            for task_id, automation_conversation_id in created_scheduler_tasks:
+                try:
+                    scheduler_repository.delete_task(task_id)
+                    storage.delete_conversation(automation_conversation_id)
+                except (FileNotFoundError, ValueError):
+                    logger.warning("Не удалось откатить Scheduler MCP | task_id=%s", task_id)
+
+        def rollback_created_reports() -> None:
+            for report_path in created_report_paths:
+                try:
+                    report_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("Не удалось откатить файловый отчёт | path=%s", report_path)
+
+        try:
+            draft_result = chat_agent.reply(
+                history,
+                user_text,
+                settings,
+                summary=summary,
+                facts=facts,
+                memory_context=memory_context,
+                task_handoff_context=handoff_context,
+                task_state=task_state,
+                policy_guidance=generation_guidance(task_state, invariants) + (
+                    "\n\nКОМПОЗИЦИЯ ОТЧЁТА:\n"
+                    "Пользователь явно попросил сохранить результат. Сначала получи необходимые исходные данные "
+                    "через доступные MCP-инструменты, затем самостоятельно проанализируй их строго по запросу "
+                    "пользователя и вызови write_file ровно с готовым полным Markdown-отчётом. Не утверждай, что "
+                    "файл сохранён, пока write_file не вернул успешный результат.\n"
+                    if file_export_enabled else ""
+                ) + (
+                    "\n\nОРКЕСТРАЦИЯ MCP:\n"
+                    "Выбирай только необходимые инструменты. Если результат одного MCP-сервера определяет "
+                    "аргументы следующего, сначала получи первый результат, затем вызови следующий инструмент "
+                    "с фактически найденными значениями. Не подменяй вызов догадкой.\n"
+                ),
+                tools=available_tools or None,
+                tool_executor=execute_tool if available_tools else None,
+            )
+        except Exception:
+            set_mcp_activity_phase(
+                str((tool_context or {}).get("mcp_activity_id") or "") or None,
+                "error",
+            )
+            rollback_created_schedules()
+            rollback_created_reports()
+            raise
         validation = None
         validation_result = None
         accepted = False
         reason = ""
         try:
+            performed_actions = [
+                str(item.get("name")) for item in draft_result.technical.get("mcp_tool_calls", [])
+                if isinstance(item, dict) and (
+                    str(item.get("name", "")).startswith(("create_scheduled_", "list_scheduled_", "get_scheduled_", "get_scheduler_"))
+                    or str(item.get("name", "")) == "write_file"
+                )
+            ]
             validation_result = chat_agent.validate_task_response(
-                validation_prompt(user_text, draft_result.content, task_state, invariants), settings
+                validation_prompt(
+                    user_text, draft_result.content, task_state, invariants,
+                    performed_actions=performed_actions,
+                ), settings
             )
             validation = parse_validation_result(validation_result.content, task_state, invariants)
             accepted = validation["allowed"]
@@ -172,6 +510,15 @@ def create_app(
                 reason = validation.get("explanation") or "Фактическое действие ответа запрещено текущей политикой."
         except PolicyValidationError as error:
             reason = str(error)
+
+        if not accepted:
+            rollback_created_schedules()
+            rollback_created_reports()
+
+        set_mcp_activity_phase(
+            str((tool_context or {}).get("mcp_activity_id") or "") or None,
+            "completed" if accepted else "blocked",
+        )
 
         content = draft_result.content if accepted else blocked_content(
             reason or "Ответ не прошёл обязательную проверку.",
@@ -509,6 +856,237 @@ def create_app(
             return api_error(str(error), 400)
         except RuntimeError as error:
             return api_error(str(error), 503)
+
+    @flask_app.get("/api/mcp/status")
+    def mcp_status():
+        return jsonify({"ok": True, "mcp": mcp.status()})
+
+    @flask_app.post("/api/mcp/start")
+    def mcp_start():
+        try:
+            return jsonify({"ok": True, "mcp": mcp.start()})
+        except RuntimeError as error:
+            logger.warning("MCP не запущен | reason=%s", error)
+            return jsonify({"ok": False, "error": str(error), "mcp": mcp.status()}), 503
+
+    @flask_app.get("/api/mcp/tools")
+    def mcp_tools():
+        try:
+            return jsonify({"ok": True, "mcp": mcp.list_tools()})
+        except RuntimeError as error:
+            logger.warning("Не удалось получить MCP-инструменты | reason=%s", error)
+            return jsonify({"ok": False, "error": str(error), "mcp": mcp.status()}), 409
+
+    @flask_app.post("/api/mcp/stop")
+    def mcp_stop():
+        try:
+            return jsonify({"ok": True, "mcp": mcp.stop()})
+        except RuntimeError as error:
+            logger.warning("MCP не остановлен штатно | reason=%s", error)
+            return jsonify({"ok": False, "error": str(error), "mcp": mcp.status()}), 503
+
+    @flask_app.get("/api/weather-mcp/status")
+    def weather_mcp_status():
+        return jsonify({"ok": True, "mcp": weather_mcp.status()})
+
+    @flask_app.post("/api/weather-mcp/start")
+    def weather_mcp_start():
+        try:
+            status = weather_mcp.start()
+            tools = weather_mcp.list_tools()
+            return jsonify({"ok": True, "mcp": {**status, **tools}})
+        except RuntimeError as error:
+            logger.warning("Open-Meteo MCP не запущен: %s", error)
+            return jsonify({"ok": False, "error": str(error), "mcp": weather_mcp.status()}), 503
+
+    @flask_app.get("/api/weather-mcp/tools")
+    def weather_mcp_tools():
+        try:
+            return jsonify({"ok": True, "mcp": weather_mcp.list_tools()})
+        except RuntimeError as error:
+            return jsonify({"ok": False, "error": str(error), "mcp": weather_mcp.status()}), 409
+
+    @flask_app.post("/api/weather-mcp/stop")
+    def weather_mcp_stop():
+        try:
+            return jsonify({"ok": True, "mcp": weather_mcp.stop()})
+        except RuntimeError as error:
+            return jsonify({"ok": False, "error": str(error), "mcp": weather_mcp.status()}), 503
+
+    orchestration_managers = {
+        "mediawiki": mediawiki_mcp,
+        "worldbank": worldbank_mcp,
+    }
+
+    @flask_app.get("/api/orchestration-mcp/<server_name>/status")
+    def orchestration_mcp_status(server_name: str):
+        manager = orchestration_managers.get(server_name)
+        if manager is None:
+            return api_error("Неизвестный MCP-сервер.", 404)
+        return jsonify({"ok": True, "mcp": manager.status()})
+
+    @flask_app.route("/api/orchestration-mcp/<server_name>/<action>", methods=["GET", "POST"])
+    def orchestration_mcp_action(server_name: str, action: str):
+        manager = orchestration_managers.get(server_name)
+        if manager is None or action not in {"start", "tools", "stop"}:
+            return api_error("Неизвестная операция MCP.", 404)
+        try:
+            if action == "start":
+                status = manager.start()
+                tools = manager.list_tools()
+                return jsonify({"ok": True, "mcp": {**status, **tools}})
+            if action == "tools":
+                return jsonify({"ok": True, "mcp": manager.list_tools()})
+            return jsonify({"ok": True, "mcp": manager.stop()})
+        except RuntimeError as error:
+            status_code = 409 if action == "tools" else 503
+            return jsonify({"ok": False, "error": str(error), "mcp": manager.status()}), status_code
+
+    @flask_app.get("/api/mcp/activity/<activity_id>")
+    def mcp_activity(activity_id: str):
+        if not re.fullmatch(r"[0-9a-f]{32}", activity_id):
+            return api_error("Некорректный идентификатор выполнения.", 400)
+        with mcp_activity_lock:
+            activity = deepcopy(mcp_activities.get(activity_id))
+        if activity is None:
+            return api_error("Выполнение ещё не зарегистрировано.", 404)
+        return jsonify({"ok": True, "activity": activity})
+
+    def owned_scheduled_task(task_id: str) -> dict[str, Any]:
+        task = scheduler_repository.get_task(task_id)
+        if task.get("owner_profile_id") != current_profile_id():
+            raise PermissionError("Запланированное задание принадлежит другому профилю.")
+        return task
+
+    @flask_app.get("/api/scheduler/state")
+    def scheduler_state():
+        profile_id = current_profile_id()
+        return jsonify({
+            "ok": True,
+            "scheduler": {
+                "running": scheduler.status()["running"],
+                "timezone": TIMEZONE_NAME,
+            },
+            "mcp": scheduler_mcp.status(),
+            "tasks": scheduler_repository.list_tasks(profile_id),
+            "runs": [
+                run for run in scheduler_repository.list_runs(limit=100)
+                if scheduler_repository.get_task(run["task_id"]).get("owner_profile_id") == profile_id
+            ],
+            "summary": scheduler_repository.summary(profile_id),
+        })
+
+    @flask_app.get("/api/scheduler/tools")
+    def scheduler_tools():
+        try:
+            return jsonify({"ok": True, "mcp": scheduler_mcp.list_tools()})
+        except RuntimeError as error:
+            return jsonify({"ok": False, "error": str(error), "mcp": scheduler_mcp.status()}), 409
+
+    @flask_app.post("/api/scheduler/tasks")
+    def create_scheduled_task_api():
+        data = json_body()
+        project_id = str(data.get("project_id") or "") or None
+        try:
+            if project_id:
+                accessible_project(project_id)
+            settings = AgentSettings.from_dict(data.get("settings")).to_dict()
+            task = scheduler_repository.create_task(
+                title=data.get("title", "Автоматизация"),
+                prompt=data.get("prompt", ""),
+                schedule_type=data.get("schedule_type", "once"),
+                run_at=data.get("run_at"),
+                delay_minutes=data.get("delay_minutes"),
+                interval_minutes=data.get("interval_minutes"),
+                mcp_servers=data.get("mcp_servers") or [],
+                allowed_tools=data.get("allowed_tools") or [],
+                owner_profile_id=current_profile_id(),
+                source_conversation_id=data.get("source_conversation_id"),
+                project_id=project_id,
+                settings=settings,
+            )
+            try:
+                conversation = storage.create_conversation(
+                    f"Автоматизация · {task['title']}", project_id, current_profile_id()
+                )
+                task = scheduler_repository.attach_context(
+                    task["id"], owner_profile_id=current_profile_id(),
+                    conversation_id=conversation["id"],
+                    source_conversation_id=data.get("source_conversation_id"),
+                    project_id=project_id, settings=settings,
+                )
+            except Exception:
+                scheduler_repository.delete_task(task["id"])
+                raise
+            return jsonify({"ok": True, "task": task, "conversation": with_token_totals(conversation)}), 201
+        except (ValueError, KeyError) as error:
+            return api_error(str(error).strip("'"), 400)
+        except (FileNotFoundError, PermissionError):
+            return api_error("Проект не найден или недоступен.", 404)
+
+    @flask_app.patch("/api/scheduler/tasks/<task_id>")
+    def update_scheduled_task_api(task_id: str):
+        try:
+            current = owned_scheduled_task(task_id)
+            data = json_body()
+            task = scheduler_repository.update_task(task_id, **data)
+            if data.get("title") and current.get("conversation_id"):
+                storage.rename_conversation(current["conversation_id"], f"Автоматизация · {task['title']}")
+            return jsonify({"ok": True, "task": task})
+        except FileNotFoundError:
+            return api_error("Запланированное задание не найдено.", 404)
+        except PermissionError:
+            return api_error("Нет доступа к запланированному заданию.", 403)
+        except (ValueError, KeyError) as error:
+            return api_error(str(error).strip("'"), 400)
+
+    @flask_app.post("/api/scheduler/tasks/<task_id>/<action>")
+    def scheduled_task_action(task_id: str, action: str):
+        try:
+            owned_scheduled_task(task_id)
+            if action == "pause":
+                task = scheduler_repository.set_status(task_id, "paused")
+            elif action == "resume":
+                task = scheduler_repository.set_status(task_id, "enabled")
+            elif action == "run-now":
+                task = scheduler_repository.request_run_now(task_id)
+            else:
+                return api_error("Неизвестное действие расписания.", 404)
+            return jsonify({"ok": True, "task": task})
+        except FileNotFoundError:
+            return api_error("Запланированное задание не найдено.", 404)
+        except PermissionError:
+            return api_error("Нет доступа к запланированному заданию.", 403)
+        except ValueError as error:
+            return api_error(str(error), 409)
+
+    @flask_app.delete("/api/scheduler/tasks/<task_id>")
+    def delete_scheduled_task_api(task_id: str):
+        try:
+            owned_scheduled_task(task_id)
+            scheduler_repository.delete_task(task_id)
+            return jsonify({"ok": True})
+        except FileNotFoundError:
+            return api_error("Запланированное задание не найдено.", 404)
+        except PermissionError:
+            return api_error("Нет доступа к запланированному заданию.", 403)
+        except ValueError as error:
+            return api_error(str(error), 409)
+
+    @flask_app.get("/api/scheduler/tasks/<task_id>/runs")
+    def scheduled_task_runs(task_id: str):
+        try:
+            owned_scheduled_task(task_id)
+            return jsonify({"ok": True, "runs": scheduler_repository.list_runs(task_id, 100)})
+        except FileNotFoundError:
+            return api_error("Запланированное задание не найдено.", 404)
+        except PermissionError:
+            return api_error("Нет доступа к запланированному заданию.", 403)
+
+    @flask_app.post("/api/scheduler/notifications/read")
+    def read_scheduler_notifications():
+        count = scheduler_repository.mark_notifications_read(current_profile_id())
+        return jsonify({"ok": True, "read_count": count, "summary": scheduler_repository.summary(current_profile_id())})
 
     @flask_app.post("/api/conversations")
     def create_conversation():
@@ -924,6 +1502,7 @@ def create_app(
     def send_message(conversation_id: str):
         try:
             data = json_body()
+            mcp_activity_id = begin_mcp_activity(str(data.get("mcp_activity_id") or "") or None)
             settings = AgentSettings.from_dict(data.get("settings"))
             source = configuration_source(data.get("preset_id"), settings, preset_manager)
             conversation = accessible_conversation(conversation_id)
@@ -974,6 +1553,7 @@ def create_app(
                 "configuration_source": source,
                 "settings": settings_snapshot,
                 "automatic_continuation": automatic,
+                "scheduled_automation": deepcopy(_automation_run_override.get()),
             },
         }
         append_tree_message(conversation, user_message)
@@ -1009,6 +1589,14 @@ def create_app(
                 task_state=task_state_snapshot,
                 handoff_context=handoff_snapshot,
                 invariants=invariant_snapshot,
+                tool_context={
+                    "profile_id": profile_id,
+                    "source_conversation_id": conversation_id,
+                    "project_id": conversation.get("project_id"),
+                    "settings": settings_snapshot,
+                    "enable_file_export": requests_file_export(content),
+                    "mcp_activity_id": mcp_activity_id,
+                },
             )
             usage = normalize_token_usage(result.technical.get("usage"))
             request_status = result.technical.get("request_status", "completed")
@@ -1092,6 +1680,7 @@ def create_app(
                     "task_state": task_state_snapshot,
                     "task_handoff_context": handoff_snapshot,
                     "invariants": invariant_snapshot,
+                    "scheduled_automation": deepcopy(_automation_run_override.get()),
                 },
             }
             append_tree_message(conversation, assistant_message, parent_id=user_message["id"])
@@ -1124,6 +1713,7 @@ def create_app(
             )
             return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
         except Exception as error:
+            set_mcp_activity_phase(mcp_activity_id, "error", friendly_api_error(error))
             logger.exception(
                 "Ошибка обработки сообщения | conversation_id=%s | exchange_id=%s | model=%s",
                 conversation_id, exchange_id, settings.model,
@@ -1376,6 +1966,47 @@ def create_app(
         except KeyError:
             return api_error("Пресет не найден.", 404)
 
+    def run_scheduled_automation(task: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
+        if "open-meteo" in task.get("mcp_servers", []):
+            weather_mcp.start()
+            weather_mcp.list_tools()
+        profile_token = _profile_override.set(str(task["owner_profile_id"]))
+        automation_token = _automation_run_override.set({
+            "task_id": task["id"], "run_id": run["id"],
+            "scheduled_for": run["scheduled_for"],
+        })
+        tools_token = _scheduled_tool_allowlist.set(set(task.get("allowed_tools", [])))
+        try:
+            client = flask_app.test_client()
+            response = client.post(
+                f"/api/conversations/{task['conversation_id']}/messages",
+                json={"content": task["prompt"], "settings": task.get("settings") or {}},
+            )
+            payload = response.get_json(silent=True) or {}
+            if response.status_code != 200 or not payload.get("ok"):
+                raise RuntimeError(payload.get("error") or f"Внутренний запрос завершился с HTTP {response.status_code}.")
+            messages = payload.get("conversation", {}).get("messages", [])
+            assistant = next((item for item in reversed(messages) if item.get("role") == "assistant"), None)
+            if not assistant:
+                raise RuntimeError("Запланированный запуск не вернул ответ агента.")
+            if assistant.get("technical", {}).get("request_status") != "completed":
+                raise RuntimeError(assistant.get("content") or "Ответ автоматизации заблокирован.")
+            return {"content": assistant.get("content", ""), "message_id": assistant.get("id")}
+        finally:
+            _scheduled_tool_allowlist.reset(tools_token)
+            _automation_run_override.reset(automation_token)
+            _profile_override.reset(profile_token)
+
+    scheduler.set_runner(run_scheduled_automation)
+    if scheduler_autostart:
+        scheduler_mcp.start()
+        scheduler_mcp.list_tools()
+        scheduler.start()
+    if orchestration_autostart:
+        for manager in (mediawiki_mcp, worldbank_mcp):
+            manager.start()
+            manager.list_tools()
+
     return flask_app
 
 
@@ -1494,16 +2125,28 @@ if __name__ == "__main__":
 
     _direct_log_paths = configure_logging(BASE_DIR / "logs")
 
-app = create_app(voice_service=WhisperService(BASE_DIR, autostart=False))
+app = create_app(voice_service=WhisperService(BASE_DIR, autostart=False), scheduler_autostart=False)
 
 
 if __name__ == "__main__":
     app.extensions["whisper_service"].start()
+    app.extensions["scheduler_mcp_manager"].start()
+    app.extensions["scheduler_mcp_manager"].list_tools()
+    app.extensions["scheduler_service"].start()
+    for extension_name in ("mediawiki_mcp_manager", "worldbank_mcp_manager"):
+        app.extensions[extension_name].start()
+        app.extensions[extension_name].list_tools()
     logger.info("Приложение запущено напрямую через app.py | url=http://127.0.0.1:5000")
     print(f"Общий журнал: {_direct_log_paths['app']}")
     print(f"Журнал ошибок: {_direct_log_paths['errors']}")
     try:
         app.run(host="127.0.0.1", port=5000, debug=False, threaded=True)
     finally:
+        app.extensions["scheduler_service"].stop()
+        app.extensions["scheduler_mcp_manager"].stop()
+        app.extensions["weather_mcp_manager"].stop()
+        app.extensions["mediawiki_mcp_manager"].stop()
+        app.extensions["worldbank_mcp_manager"].stop()
+        app.extensions["mcp_manager"].stop()
         app.extensions["whisper_service"].stop()
         logger.info("Приложение остановлено")

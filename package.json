@@ -1,0 +1,9 @@
+{
+  "name": "deepseek-agent-local-mcp",
+  "private": true,
+  "dependencies": {
+    "@cyanheads/worldbank-mcp-server": "0.5.2",
+    "@modelcontextprotocol/server-filesystem": "2026.8.31",
+    "@professional-wiki/mediawiki-mcp-server": "0.17.0"
+  }
+}

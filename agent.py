@@ -7,7 +7,7 @@ import logging
 import os
 import time
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 
 logger = logging.getLogger("deepseek_agent.provider")
@@ -226,6 +226,141 @@ class DeepSeekProvider:
             technical=technical,
         )
 
+    def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        settings: AgentSettings,
+        tools: list[dict[str, Any]],
+        tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]],
+        max_rounds: int = 6,
+    ) -> AgentResult:
+        """Выполняет цикл DeepSeek function calling, а сами функции вызывает через MCP."""
+        api_tools = [{
+            "type": "function",
+            "function": {
+                "name": tool["name"],
+                "description": tool.get("description") or "",
+                "parameters": tool.get("input_schema") or {"type": "object", "properties": {}},
+            },
+        } for tool in tools]
+        allowed_names = {tool["name"] for tool in tools}
+        working_messages = list(messages)
+        tool_audit: list[dict[str, Any]] = []
+        request_ids: list[str] = []
+        total_usage = {
+            "input_tokens": 0, "output_tokens": 0, "total_tokens": 0,
+            "cached_input_tokens": 0, "uncached_input_tokens": 0, "reasoning_tokens": 0,
+        }
+        started = time.perf_counter()
+        final_message = None
+        final_choice = None
+        final_response = None
+
+        for round_number in range(1, max_rounds + 1):
+            request_args: dict[str, Any] = {
+                "model": settings.model,
+                "messages": working_messages,
+                "tools": api_tools,
+                "tool_choice": "auto",
+                "temperature": settings.temperature,
+                "top_p": settings.top_p,
+                "stream": False,
+                "response_format": {"type": settings.response_format},
+                "logprobs": settings.logprobs,
+                "extra_body": {
+                    "thinking": {"type": "enabled" if settings.reasoning_enabled else "disabled"},
+                    "reasoning_effort": settings.reasoning_effort,
+                },
+            }
+            if settings.max_tokens is not None:
+                request_args["max_tokens"] = settings.max_tokens
+            if settings.stop:
+                request_args["stop"] = settings.stop
+            if settings.top_logprobs is not None:
+                request_args["top_logprobs"] = settings.top_logprobs
+
+            response = self._get_client().chat.completions.create(**request_args)
+            choice = response.choices[0]
+            message = choice.message
+            usage = getattr(response, "usage", None)
+            completion_details = getattr(usage, "completion_tokens_details", None)
+            values = {
+                "input_tokens": _usage_value(usage, "prompt_tokens"),
+                "output_tokens": _usage_value(usage, "completion_tokens"),
+                "total_tokens": _usage_value(usage, "total_tokens"),
+                "cached_input_tokens": _usage_value(usage, "prompt_cache_hit_tokens"),
+                "uncached_input_tokens": _usage_value(usage, "prompt_cache_miss_tokens"),
+                "reasoning_tokens": _usage_value(completion_details, "reasoning_tokens"),
+            }
+            for key, value in values.items():
+                total_usage[key] += value
+            if getattr(response, "id", None):
+                request_ids.append(response.id)
+            final_message, final_choice, final_response = message, choice, response
+            tool_calls = list(getattr(message, "tool_calls", None) or [])
+            if not tool_calls:
+                break
+
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": getattr(message, "content", None),
+                "tool_calls": [call.model_dump(exclude_none=True) for call in tool_calls],
+            }
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning:
+                assistant_message["reasoning_content"] = reasoning
+            working_messages.append(assistant_message)
+
+            for call in tool_calls:
+                name = str(call.function.name)
+                try:
+                    arguments = json.loads(call.function.arguments or "{}")
+                    if not isinstance(arguments, dict):
+                        raise ValueError("Аргументы инструмента должны быть JSON-объектом.")
+                    if name not in allowed_names:
+                        raise ValueError(f"Инструмент {name!r} не разрешён.")
+                    output = tool_executor(name, arguments)
+                    audit = {
+                        "round": round_number,
+                        "server": output.get("mcp_server"),
+                        "name": name,
+                        "arguments": arguments,
+                        "is_error": bool(output.get("is_error")),
+                    }
+                except Exception as error:
+                    output = {"tool": name, "is_error": True, "error": str(error)}
+                    audit = {"round": round_number, "name": name, "arguments": {}, "is_error": True, "error": str(error)}
+                tool_audit.append(audit)
+                working_messages.append({
+                    "role": "tool", "tool_call_id": call.id,
+                    "content": json.dumps(output, ensure_ascii=False),
+                })
+        else:
+            raise RuntimeError(f"DeepSeek не завершил цепочку инструментов за {max_rounds} раундов.")
+
+        if final_message is None or final_choice is None or final_response is None:
+            raise RuntimeError("DeepSeek не вернул ответ в цикле инструментов.")
+        elapsed = time.perf_counter() - started
+        technical = {
+            "provider": "deepseek",
+            "request_id": request_ids[-1] if request_ids else None,
+            "request_ids": request_ids,
+            "model": getattr(final_response, "model", None) or settings.model,
+            "system_fingerprint": getattr(final_response, "system_fingerprint", None),
+            "finish_reason": getattr(final_choice, "finish_reason", None),
+            "elapsed_seconds": round(elapsed, 3),
+            "usage": total_usage,
+            "settings": settings.to_dict(),
+            "mcp_tool_calls": tool_audit,
+        }
+        logger.info("DeepSeek MCP-цикл завершён | rounds=%s | tool_calls=%s | elapsed=%.3f",
+                    len(request_ids), len(tool_audit), elapsed)
+        return AgentResult(
+            content=getattr(final_message, "content", None) or "(Модель не вернула текст ответа)",
+            reasoning_content=getattr(final_message, "reasoning_content", None) or "",
+            technical=technical,
+        )
+
 
 class Agent:
     """Самостоятельная сущность, управляющая контекстом запроса и ответом LLM."""
@@ -244,6 +379,8 @@ class Agent:
         task_handoff_context: dict[str, Any] | None = None,
         task_state: dict[str, Any] | None = None,
         policy_guidance: str = "",
+        tools: list[dict[str, Any]] | None = None,
+        tool_executor: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> AgentResult:
         system_prompt = settings.system_prompt
         if memory_context:
@@ -373,6 +510,9 @@ class Agent:
                 messages.append({"role": role, "content": content})
         messages.append({"role": "user", "content": user_text})
         request_settings = replace(settings, response_format="text") if policy_guidance else settings
+        complete_with_tools = getattr(self.provider, "complete_with_tools", None)
+        if tools and tool_executor and callable(complete_with_tools):
+            return complete_with_tools(messages, request_settings, tools, tool_executor)
         return self.provider.complete(messages, request_settings)
 
     def validate_task_response(self, prompt: str, settings: AgentSettings) -> AgentResult:

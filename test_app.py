@@ -6,6 +6,7 @@ import os
 import socket
 import tempfile
 import unittest
+from copy import deepcopy
 from unittest import mock
 from io import BytesIO
 from pathlib import Path
@@ -100,6 +101,105 @@ class FakeProvider:
         )
 
 
+class ToolAwareFakeProvider(FakeProvider):
+    def complete_with_tools(self, messages, settings, tools, tool_executor):
+        base = super().complete(messages, settings)
+        arguments = {"latitude": 55.03, "longitude": 82.92}
+        output = tool_executor("get_current_weather", arguments)
+        return AgentResult(
+            content="Сейчас 12 °C. Подойдёт лёгкая куртка.",
+            reasoning_content="",
+            technical={**base.technical, "mcp_tool_calls": [{
+                "round": 1, "name": "get_current_weather", "arguments": arguments,
+                "is_error": output["is_error"],
+            }]},
+        )
+
+
+class WeatherReportPipelineProvider(FakeProvider):
+    """Имитирует выбор погоды, обработку моделью и последующую запись отчёта."""
+
+    def complete(self, messages, settings):
+        system = messages[0]["content"]
+        if "строгий контроллер этапов" in system and "write_file" in messages[-1]["content"]:
+            self.calls.append((messages, settings))
+            context = json.loads(messages[-1]["content"].rsplit("Политика:\n", 1)[1])
+            return AgentResult(json.dumps({
+                "allowed": True, "detected_action_type": "file_export",
+                "checked_invariant_ids": [item["ref"] for item in context["invariants"]],
+                "violated_invariant_ids": [], "stage_complete": False,
+                "recommended_event": None, "required_artifacts": [], "explanation": "",
+            }, ensure_ascii=False), "", super().complete(messages, settings).technical)
+        return super().complete(messages, settings)
+
+    def complete_with_tools(self, messages, settings, tools, tool_executor):
+        base = super().complete(messages, settings)
+        names = {tool["name"] for tool in tools}
+        if not {"get_current_weather", "write_file"}.issubset(names):
+            raise AssertionError(f"Не получены инструменты композиции: {sorted(names)}")
+        weather_arguments = {"latitude": 55.03, "longitude": 82.92}
+        weather = tool_executor("get_current_weather", weather_arguments)
+        temperature = weather["result"]["current"]["temperature_2m"]
+        report = (
+            "# Погодный отчёт для Новосибирска\n\n"
+            f"Температура: {temperature} °C. Для прогулки подойдёт лёгкая куртка.\n"
+        )
+        file_arguments = {"path": "../../чужая-папка/weather.md", "content": report}
+        saved = tool_executor("write_file", file_arguments)
+        relative_path = saved["result"]["relative_path"]
+        return AgentResult(
+            content=f"Прогноз обработан, отчёт сохранён: {relative_path}",
+            reasoning_content="",
+            technical={**base.technical, "mcp_tool_calls": [
+                {"round": 1, "name": "get_current_weather", "arguments": weather_arguments,
+                 "is_error": weather["is_error"]},
+                {"round": 2, "name": "write_file", "arguments": file_arguments,
+                 "is_error": saved["is_error"]},
+            ]},
+        )
+
+
+class BlockedWeatherReportPipelineProvider(WeatherReportPipelineProvider):
+    def complete(self, messages, settings):
+        system = messages[0]["content"]
+        if "строгий контроллер этапов" in system and "write_file" in messages[-1]["content"]:
+            self.calls.append((messages, settings))
+            context = json.loads(messages[-1]["content"].rsplit("Политика:\n", 1)[1])
+            return AgentResult(json.dumps({
+                "allowed": False, "detected_action_type": "implementation",
+                "checked_invariant_ids": [item["ref"] for item in context["invariants"]],
+                "violated_invariant_ids": [], "stage_complete": False,
+                "recommended_event": None, "required_artifacts": [],
+                "explanation": "Экспорт ошибочно классифицирован как реализация.",
+            }, ensure_ascii=False), "", FakeProvider.complete(self, messages, settings).technical)
+        return FakeProvider.complete(self, messages, settings)
+
+
+class OrchestrationFakeProvider(FakeProvider):
+    """Имитирует зависимую цепочку MediaWiki -> World Bank."""
+
+    def complete_with_tools(self, messages, settings, tools, tool_executor):
+        base = super().complete(messages, settings)
+        names = {tool["name"] for tool in tools}
+        if not {"search-page", "worldbank_get_data"}.issubset(names):
+            raise AssertionError(f"Не получены инструменты оркестрации: {sorted(names)}")
+        if "update-page" in names:
+            raise AssertionError("MediaWiki write-инструмент не должен передаваться модели")
+        wiki_args = {"query": "largest countries South America", "limit": 5}
+        wiki = tool_executor("search-page", wiki_args)
+        country_codes = wiki["result"]["country_codes"]
+        bank_args = {"indicator_id": "SP.POP.TOTL", "countries": country_codes, "mrnev": 1}
+        bank = tool_executor("worldbank_get_data", bank_args)
+        return AgentResult(
+            content="MediaWiki определил страны, World Bank вернул показатели населения.",
+            reasoning_content="",
+            technical={**base.technical, "mcp_tool_calls": [
+                {"round": 1, "server": wiki["mcp_server"], "name": "search-page", "arguments": wiki_args, "is_error": False},
+                {"round": 2, "server": bank["mcp_server"], "name": "worldbank_get_data", "arguments": bank_args, "is_error": False},
+            ]},
+        )
+
+
 class MemoryProvider(FakeProvider):
     def complete(self, messages, settings):
         result = super().complete(messages, settings)
@@ -155,6 +255,30 @@ class MislabeledImplementationProvider(FakeProvider):
                 "allowed": False, "detected_action_type": "implementation",
                 "checked_invariant_ids": [item["ref"] for item in context["invariants"]],
                 "violated_invariant_ids": [], "explanation": "Черновик фактически содержит реализацию до утверждения плана.",
+            }
+            return AgentResult(json.dumps(verdict, ensure_ascii=False), "", result.technical)
+        return result
+
+
+class IncompleteAnalysisProvider(FakeProvider):
+    """Имитирует ошибку валидатора: разрешённый анализ принят за незавершённый план."""
+
+    def complete(self, messages, settings):
+        result = super().complete(messages, settings)
+        system = messages[0]["content"]
+        if "ОГРАНИЧЕНИЯ КОНТРОЛИРУЕМОГО ОТВЕТА" in system:
+            return AgentResult("Сейчас +12 °C, подойдёт лёгкая куртка.", "", result.technical)
+        if "строгий контроллер этапов" in system:
+            context = json.loads(messages[-1]["content"].rsplit("Политика:\n", 1)[1])
+            verdict = {
+                "allowed": False,
+                "detected_action_type": "analysis",
+                "checked_invariant_ids": [item["ref"] for item in context["invariants"]],
+                "violated_invariant_ids": [],
+                "stage_complete": False,
+                "recommended_event": None,
+                "required_artifacts": [],
+                "explanation": "Ответ не завершает этап planning.",
             }
             return AgentResult(json.dumps(verdict, ensure_ascii=False), "", result.technical)
         return result
@@ -274,6 +398,144 @@ class FakeVoiceService:
         pass
 
 
+class FakeMCPManager:
+    def __init__(self):
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.tools_calls = 0
+        self.running = False
+
+    def status(self):
+        return {
+            "phase": "running" if self.running else "stopped",
+            "connected": self.running,
+            "message": "MCP-соединение установлено." if self.running else "MCP-сервер не запущен.",
+            "error": None,
+            "server": {"name": "filesystem-test", "version": "1.0.0"} if self.running else {"name": None, "version": None},
+            "protocol_version": "2025-11-25" if self.running else None,
+            "workspace": "C:\\test\\workspace",
+            "tool_count": 1 if self.tools_calls else 0,
+        }
+
+    def start(self):
+        if not self.running:
+            self.start_calls += 1
+            self.running = True
+        return self.status()
+
+    def list_tools(self):
+        if not self.running:
+            raise RuntimeError("MCP-соединение не запущено.")
+        self.tools_calls += 1
+        return {
+            **self.status(),
+            "tool_count": 1,
+            "tools": [{
+                "name": "read_text_file",
+                "title": None,
+                "description": "Read a file",
+                "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}},
+            }],
+        }
+
+    def stop(self):
+        if self.running:
+            self.stop_calls += 1
+            self.running = False
+        return self.status()
+
+
+class FakeWeatherMCPManager(FakeMCPManager):
+    def __init__(self, running=False):
+        super().__init__()
+        self.running = running
+        self.called = []
+
+    def status(self):
+        status = super().status()
+        status["server"] = {"name": "open-meteo-test", "version": "1.0.0"} if self.running else {"name": None, "version": None}
+        return status
+
+    def list_tools(self):
+        if not self.running:
+            raise RuntimeError("MCP-соединение не запущено.")
+        self.tools_calls += 1
+        return {**self.status(), "tool_count": 1, "tools": self.tools_for_model()}
+
+    def tools_for_model(self):
+        return [{
+            "name": "get_current_weather", "title": None, "description": "Текущая погода",
+            "input_schema": {"type": "object", "properties": {"latitude": {"type": "number"}, "longitude": {"type": "number"}}},
+        }]
+
+    def call_tool(self, name, arguments):
+        self.called.append((name, arguments))
+        return {"tool": name, "arguments": arguments, "is_error": False, "result": {"current": {"temperature_2m": 12}}}
+
+
+class FakeOrchestrationMCPManager(FakeMCPManager):
+    def __init__(self, server_name, tools, results, running=True):
+        super().__init__()
+        self.server_name = server_name
+        self._tools = tools
+        self.results = results
+        self.running = running
+        self.called = []
+
+    def status(self):
+        status = super().status()
+        status["server"] = {"name": self.server_name, "version": "1.0.0"} if self.running else {"name": None, "version": None}
+        status["tool_count"] = len(self._tools) if self.running else 0
+        return status
+
+    def list_tools(self):
+        if not self.running:
+            raise RuntimeError("MCP-соединение не запущено.")
+        return {**self.status(), "tools": self.tools_for_model()}
+
+    def tools_for_model(self):
+        return [{
+            "name": name, "title": None, "description": name,
+            "input_schema": {"type": "object", "properties": {}},
+        } for name in self._tools]
+
+    def call_tool(self, name, arguments):
+        self.called.append((name, arguments))
+        return {"tool": name, "arguments": arguments, "is_error": False, "result": self.results[name]}
+
+
+class FakeFilesystemWriteMCPManager(FakeMCPManager):
+    def __init__(self, workspace: Path):
+        super().__init__()
+        self.workspace = workspace.resolve()
+        self.called = []
+
+    def status(self):
+        status = super().status()
+        status["workspace"] = str(self.workspace)
+        return status
+
+    def list_tools(self):
+        if not self.running:
+            raise RuntimeError("MCP-соединение не запущено.")
+        self.tools_calls += 1
+        return {**self.status(), "tool_count": 1, "tools": [{
+            "name": "write_file", "title": "Write File", "description": "Write a file",
+            "input_schema": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                "required": ["path", "content"],
+            },
+        }]}
+
+    def call_tool(self, name, arguments):
+        self.called.append((name, arguments))
+        path = Path(arguments["path"])
+        path.write_text(arguments["content"], encoding="utf-8")
+        return {"tool": name, "arguments": arguments, "is_error": False,
+                "result": {"content": f"Successfully wrote to {path}"}}
+
+
 class AgentTests(unittest.TestCase):
     def test_agent_owns_context_and_uses_current_system_prompt(self):
         provider = FakeProvider()
@@ -317,6 +579,104 @@ class AgentTests(unittest.TestCase):
         self.assertEqual(result.technical["usage"]["reasoning_tokens"], 5)
         self.assertEqual(result.technical["usage"]["total_tokens"], 20)
         self.assertIn("elapsed_seconds", result.technical)
+
+    def test_deepseek_provider_calls_mcp_tool_and_uses_result(self):
+        class ToolCall:
+            id = "call-weather"
+            function = SimpleNamespace(name="get_current_weather", arguments='{"latitude":55,"longitude":83}')
+
+            def model_dump(self, exclude_none=True):
+                return {"id": self.id, "type": "function", "function": {"name": self.function.name, "arguments": self.function.arguments}}
+
+        usage = SimpleNamespace(prompt_tokens=5, completion_tokens=3, total_tokens=8,
+                                prompt_cache_hit_tokens=0, prompt_cache_miss_tokens=5,
+                                completion_tokens_details=SimpleNamespace(reasoning_tokens=0))
+        first = SimpleNamespace(
+            id="req-tool", model="deepseek-v4-flash", system_fingerprint=None, usage=usage,
+            choices=[SimpleNamespace(message=SimpleNamespace(content=None, reasoning_content="", tool_calls=[ToolCall()]), finish_reason="tool_calls")],
+        )
+        second = SimpleNamespace(
+            id="req-final", model="deepseek-v4-flash", system_fingerprint=None, usage=usage,
+            choices=[SimpleNamespace(message=SimpleNamespace(content="Наденьте куртку.", reasoning_content="", tool_calls=[]), finish_reason="stop")],
+        )
+        requests = []
+        responses = iter([first, second])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kwargs: requests.append(kwargs) or next(responses)
+        )))
+        calls = []
+        result = DeepSeekProvider(client).complete_with_tools(
+            [{"role": "user", "content": "Что надеть?"}], AgentSettings(),
+            [{"name": "get_current_weather", "description": "Погода", "input_schema": {"type": "object"}}],
+            lambda name, arguments: calls.append((name, arguments)) or {"is_error": False, "result": {"temperature": 12}},
+        )
+        self.assertEqual(result.content, "Наденьте куртку.")
+        self.assertEqual(calls[0][0], "get_current_weather")
+        self.assertEqual(requests[1]["messages"][-1]["role"], "tool")
+        self.assertIn('"temperature": 12', requests[1]["messages"][-1]["content"])
+        self.assertEqual(result.technical["usage"]["total_tokens"], 16)
+        self.assertEqual(result.technical["mcp_tool_calls"][0]["name"], "get_current_weather")
+
+    def test_deepseek_provider_composes_weather_then_write_file(self):
+        class ToolCall:
+            def __init__(self, call_id, name, arguments):
+                self.id = call_id
+                self.function = SimpleNamespace(name=name, arguments=json.dumps(arguments, ensure_ascii=False))
+
+            def model_dump(self, exclude_none=True):
+                return {"id": self.id, "type": "function", "function": {
+                    "name": self.function.name, "arguments": self.function.arguments,
+                }}
+
+        usage = SimpleNamespace(prompt_tokens=4, completion_tokens=2, total_tokens=6,
+                                prompt_cache_hit_tokens=0, prompt_cache_miss_tokens=4,
+                                completion_tokens_details=SimpleNamespace(reasoning_tokens=0))
+
+        def response(request_id, content, tool_calls, finish_reason):
+            return SimpleNamespace(
+                id=request_id, model="deepseek-v4-flash", system_fingerprint=None, usage=usage,
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content=content, reasoning_content="", tool_calls=tool_calls,
+                ), finish_reason=finish_reason)],
+            )
+
+        first = response("req-weather", None, [ToolCall(
+            "call-weather", "get_current_weather", {"latitude": 55.03, "longitude": 82.92},
+        )], "tool_calls")
+        second = response("req-write", None, [ToolCall(
+            "call-write", "write_file", {
+                "path": "weather.md", "content": "# Отчёт\n\nТемпература: 12 °C. Лёгкая куртка.\n",
+            },
+        )], "tool_calls")
+        third = response("req-final", "Отчёт сохранён.", [], "stop")
+        requests = []
+        responses = iter([first, second, third])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
+            create=lambda **kwargs: requests.append(deepcopy(kwargs)) or next(responses)
+        )))
+        calls = []
+
+        def execute(name, arguments):
+            calls.append((name, arguments))
+            if name == "get_current_weather":
+                return {"is_error": False, "result": {"current": {"temperature_2m": 12}}}
+            return {"is_error": False, "result": {"relative_path": "reports/weather.md"}}
+
+        result = DeepSeekProvider(client).complete_with_tools(
+            [{"role": "user", "content": "Узнай погоду и сохрани отчёт"}], AgentSettings(),
+            [
+                {"name": "get_current_weather", "description": "Погода", "input_schema": {"type": "object"}},
+                {"name": "write_file", "description": "Запись", "input_schema": {"type": "object"}},
+            ], execute,
+        )
+
+        self.assertEqual([item[0] for item in calls], ["get_current_weather", "write_file"])
+        self.assertIn("Температура: 12 °C", calls[1][1]["content"])
+        self.assertIn('"temperature_2m": 12', requests[1]["messages"][-1]["content"])
+        self.assertEqual(requests[2]["messages"][-1]["role"], "tool")
+        self.assertEqual(result.content, "Отчёт сохранён.")
+        self.assertEqual([item["name"] for item in result.technical["mcp_tool_calls"]],
+                         ["get_current_weather", "write_file"])
 
     def test_settings_reject_unsupported_seed_and_model_is_whitelisted(self):
         settings = AgentSettings.from_dict(AgentSettings().to_dict() | {"seed": 42})
@@ -494,6 +854,84 @@ class TaskPolicyTests(unittest.TestCase):
             "system:protect-secrets", "project:long-id:rule-id",
         ])
 
+    def test_incomplete_allowed_analysis_is_not_blocked_by_validator_flag(self):
+        verdict = json.dumps({
+            "allowed": False,
+            "detected_action_type": "analysis",
+            "checked_invariant_ids": ["I1", "I2"],
+            "violated_invariant_ids": [],
+            "stage_complete": False,
+            "recommended_event": None,
+            "required_artifacts": [],
+            "explanation": "Ответ не завершает этап planning.",
+        }, ensure_ascii=False)
+        parsed = parse_validation_result(verdict, self.state, self.invariants)
+        self.assertTrue(parsed["allowed"])
+        self.assertFalse(parsed["validator_allowed"])
+        self.assertFalse(parsed["stage_complete"])
+
+    def test_action_matrix_keeps_stage_boundaries_for_ordinary_tasks(self):
+        allowed_actions = {
+            "planning": "analysis",
+            "execution": "implementation",
+            "validation": "validation_result",
+            "done": "result_explanation",
+        }
+        blocked_actions = {
+            "planning": "implementation",
+            "execution": "planning",
+            "validation": "implementation",
+            "done": "implementation",
+        }
+        for stage, action in allowed_actions.items():
+            with self.subTest(stage=stage, action=action, expected="allowed"):
+                state = {**self.state, "stage": stage}
+                verdict = json.dumps({
+                    "allowed": False,
+                    "detected_action_type": action,
+                    "checked_invariant_ids": ["I1", "I2"],
+                    "violated_invariant_ids": [],
+                    "stage_complete": False,
+                    "recommended_event": None,
+                    "required_artifacts": [],
+                    "explanation": "Промежуточный ответ.",
+                }, ensure_ascii=False)
+                parsed = parse_validation_result(verdict, state, self.invariants)
+                self.assertTrue(parsed["allowed"])
+                self.assertFalse(parsed["validator_allowed"])
+
+        for stage, action in blocked_actions.items():
+            with self.subTest(stage=stage, action=action, expected="blocked"):
+                state = {**self.state, "stage": stage}
+                verdict = json.dumps({
+                    "allowed": True,
+                    "detected_action_type": action,
+                    "checked_invariant_ids": ["I1", "I2"],
+                    "violated_invariant_ids": [],
+                    "stage_complete": False,
+                    "recommended_event": None,
+                    "required_artifacts": [],
+                    "explanation": "",
+                }, ensure_ascii=False)
+                parsed = parse_validation_result(verdict, state, self.invariants)
+                self.assertFalse(parsed["allowed"])
+                self.assertTrue(parsed["validator_allowed"])
+
+    def test_known_invariant_violation_still_blocks_allowed_action(self):
+        verdict = json.dumps({
+            "allowed": True,
+            "detected_action_type": "analysis",
+            "checked_invariant_ids": ["I1", "I2"],
+            "violated_invariant_ids": ["I1"],
+            "stage_complete": False,
+            "recommended_event": None,
+            "required_artifacts": [],
+            "explanation": "Черновик раскрывает секрет.",
+        }, ensure_ascii=False)
+        parsed = parse_validation_result(verdict, self.state, self.invariants)
+        self.assertFalse(parsed["allowed"])
+        self.assertEqual(parsed["violated_invariant_ids"], ["system:protect-secrets"])
+
     def test_unknown_validator_reference_blocks_without_parser_failure(self):
         verdict = json.dumps({
             "allowed": True, "detected_action_type": "planning",
@@ -649,7 +1087,8 @@ class ApiTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.provider = FakeProvider()
         self.voice = FakeVoiceService()
-        self.app = create_app(Path(self.temp.name), Agent(self.provider), self.voice)
+        self.mcp = FakeMCPManager()
+        self.app = create_app(Path(self.temp.name), Agent(self.provider), self.voice, self.mcp)
         self.app.config.update(TESTING=True)
         self.client = self.app.test_client()
 
@@ -680,6 +1119,12 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn("Свободные этапы · День 13", text)
         self.assertIn('id="invariants-title"', text)
         self.assertIn('id="invariant-scope"', text)
+        self.assertIn('id="mcp-start"', text)
+        self.assertIn('id="mcp-tools"', text)
+        self.assertIn('id="mcp-stop"', text)
+        self.assertIn('id="weather-mcp-start"', text)
+        self.assertIn("Open‑Meteo MCP", text)
+        self.assertIn("только папку проекта <code>workspace</code>", text)
         self.assertIn("Разрешённые категории", text)
         self.assertIn("preferences.language", text)
         self.assertNotIn("Запустить 3 температуры", text)
@@ -689,6 +1134,174 @@ class ApiTests(unittest.TestCase):
         provider = self.client.get("/api/state").get_json()["provider"]
         self.assertEqual(provider["context_windows"]["deepseek-v4-flash"], 1_000_000)
         self.assertEqual(provider["context_windows"]["deepseek-v4-pro"], 1_000_000)
+
+    def test_mcp_long_lived_session_lists_tools_and_prevents_duplicate_start(self):
+        initial = self.client.get("/api/mcp/status")
+        self.assertEqual(initial.status_code, 200)
+        self.assertFalse(initial.get_json()["mcp"]["connected"])
+
+        started = self.client.post("/api/mcp/start")
+        repeated = self.client.post("/api/mcp/start")
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(repeated.status_code, 200)
+        self.assertTrue(started.get_json()["mcp"]["connected"])
+        self.assertEqual(self.mcp.start_calls, 1)
+
+        listed = self.client.get("/api/mcp/tools")
+        payload = listed.get_json()["mcp"]
+        self.assertEqual(listed.status_code, 200)
+        self.assertEqual(payload["server"]["name"], "filesystem-test")
+        self.assertEqual(payload["protocol_version"], "2025-11-25")
+        self.assertEqual(payload["tool_count"], 1)
+        self.assertEqual(payload["tools"][0]["name"], "read_text_file")
+        self.assertEqual(payload["tools"][0]["input_schema"]["type"], "object")
+
+        stopped = self.client.post("/api/mcp/stop")
+        self.assertEqual(stopped.status_code, 200)
+        self.assertFalse(stopped.get_json()["mcp"]["connected"])
+        self.assertEqual(self.mcp.stop_calls, 1)
+
+        unavailable = self.client.get("/api/mcp/tools")
+        self.assertEqual(unavailable.status_code, 409)
+        self.assertFalse(unavailable.get_json()["mcp"]["connected"])
+
+    def test_weather_mcp_has_separate_lifecycle_routes(self):
+        weather = FakeWeatherMCPManager()
+        app = create_app(Path(self.temp.name), Agent(self.provider), self.voice, self.mcp, weather)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        started = client.post("/api/weather-mcp/start")
+        self.assertEqual(started.status_code, 200)
+        self.assertEqual(started.get_json()["mcp"]["server"]["name"], "open-meteo-test")
+        self.assertEqual(started.get_json()["mcp"]["tools"][0]["name"], "get_current_weather")
+        self.assertEqual(client.post("/api/weather-mcp/stop").status_code, 200)
+
+    def test_chat_uses_connected_weather_mcp_and_saves_audit(self):
+        provider = ToolAwareFakeProvider()
+        weather = FakeWeatherMCPManager(running=True)
+        app = create_app(Path(self.temp.name), Agent(provider), self.voice, self.mcp, weather)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Погода"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Что надеть в Новосибирске?", "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(weather.called[0][0], "get_current_weather")
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertIn("лёгкая куртка", assistant["content"])
+        self.assertEqual(assistant["technical"]["mcp_tool_calls"][0]["name"], "get_current_weather")
+        self.assertEqual(self.mcp.start_calls, 0)
+
+    def test_day20_routes_dependent_calls_across_two_mcp_servers_and_tracks_activity(self):
+        mediawiki = FakeOrchestrationMCPManager(
+            "mediawiki-test", ["search-page", "update-page"],
+            {"search-page": {"country_codes": ["BRA", "ARG"]}},
+        )
+        worldbank = FakeOrchestrationMCPManager(
+            "worldbank-test", ["worldbank_get_data"],
+            {"worldbank_get_data": {"observations": [{"country": "BRA", "value": 1}]}},
+        )
+        app = create_app(
+            Path(self.temp.name), Agent(OrchestrationFakeProvider()), self.voice, self.mcp,
+            mediawiki_mcp_manager=mediawiki, worldbank_mcp_manager=worldbank,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Оркестрация"}).get_json()["conversation"]
+        activity_id = "a" * 32
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Найди крупнейшие страны Южной Америки и сравни население.",
+            "mcp_activity_id": activity_id,
+            "settings": AgentSettings().to_dict(),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([item[0] for item in mediawiki.called], ["search-page"])
+        self.assertEqual(worldbank.called[0][1]["countries"], ["BRA", "ARG"])
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        calls = assistant["technical"]["mcp_tool_calls"]
+        self.assertEqual([(item["server"], item["name"]) for item in calls], [
+            ("mediawiki", "search-page"), ("worldbank", "worldbank_get_data"),
+        ])
+        activity = client.get(f"/api/mcp/activity/{activity_id}").get_json()["activity"]
+        self.assertEqual(activity["phase"], "completed")
+        self.assertEqual([(item["server"], item["name"], item["status"]) for item in activity["calls"]], [
+            ("mediawiki", "search-page", "completed"),
+            ("worldbank", "worldbank_get_data", "completed"),
+        ])
+
+    def test_day20_mcp_lifecycle_routes_are_independent(self):
+        mediawiki = FakeOrchestrationMCPManager("mediawiki-test", ["search-page"], {}, running=False)
+        worldbank = FakeOrchestrationMCPManager("worldbank-test", ["worldbank_get_data"], {}, running=False)
+        app = create_app(
+            Path(self.temp.name), Agent(self.provider), self.voice, self.mcp,
+            mediawiki_mcp_manager=mediawiki, worldbank_mcp_manager=worldbank,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        self.assertEqual(client.post("/api/orchestration-mcp/mediawiki/start").status_code, 200)
+        self.assertEqual(client.post("/api/orchestration-mcp/worldbank/start").status_code, 200)
+        self.assertEqual(client.get("/api/orchestration-mcp/mediawiki/tools").get_json()["mcp"]["tools"][0]["name"], "search-page")
+        self.assertEqual(client.get("/api/orchestration-mcp/worldbank/tools").get_json()["mcp"]["tools"][0]["name"], "worldbank_get_data")
+
+    def test_file_export_intent_requires_explicit_positive_command(self):
+        self.assertTrue(app_module.requests_file_export("Узнай погоду и сохрани отчёт в файл"))
+        self.assertTrue(app_module.requests_file_export("Создай документ с прогнозом"))
+        self.assertFalse(app_module.requests_file_export("Что надеть сегодня?"))
+        self.assertFalse(app_module.requests_file_export("Покажи прогноз, но не сохраняй его"))
+
+    def test_weather_report_pipeline_starts_filesystem_and_writes_unique_report(self):
+        provider = WeatherReportPipelineProvider()
+        weather = FakeWeatherMCPManager(running=True)
+        workspace = Path(self.temp.name) / "mcp-workspace"
+        filesystem = FakeFilesystemWriteMCPManager(workspace)
+        app = create_app(Path(self.temp.name), Agent(provider), self.voice, filesystem, weather)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Погодный отчёт"}).get_json()["conversation"]
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Узнай погоду в Новосибирске, посоветуй одежду и сохрани отчёт в файл.",
+            "settings": AgentSettings().to_dict(),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(filesystem.start_calls, 1)
+        self.assertEqual([item[0] for item in weather.called], ["get_current_weather"])
+        self.assertEqual([item[0] for item in filesystem.called], ["write_file"])
+        written_path = Path(filesystem.called[0][1]["path"])
+        self.assertEqual(written_path.parent, workspace / "reports")
+        self.assertRegex(written_path.name, r"^weather-\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}\.md$")
+        self.assertTrue(written_path.is_file())
+        self.assertIn("Температура: 12 °C", written_path.read_text(encoding="utf-8"))
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(
+            [item["name"] for item in assistant["technical"]["mcp_tool_calls"]],
+            ["get_current_weather", "write_file"],
+        )
+        self.assertEqual(assistant["technical"]["policy_audit"]["detected_action_type"], "file_export")
+
+    def test_blocked_file_export_removes_report_created_before_postvalidation(self):
+        provider = BlockedWeatherReportPipelineProvider()
+        weather = FakeWeatherMCPManager(running=True)
+        workspace = Path(self.temp.name) / "blocked-workspace"
+        filesystem = FakeFilesystemWriteMCPManager(workspace)
+        app = create_app(Path(self.temp.name), Agent(provider), self.voice, filesystem, weather)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Заблокированный отчёт"}).get_json()["conversation"]
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Сохрани погодный отчёт в файл.", "settings": AgentSettings().to_dict(),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        assistant = response.get_json()["conversation"]["visible_messages"][-1]
+        self.assertEqual(assistant["technical"]["request_status"], "blocked")
+        self.assertIn("Ответ заблокирован", assistant["content"])
+        self.assertEqual(list((workspace / "reports").glob("*.md")), [])
 
     def test_task_lifecycle_controls_transitions_pause_and_resume(self):
         conversation = self.create_conversation()
@@ -930,6 +1543,24 @@ class ApiTests(unittest.TestCase):
         self.assertIn("Ответ заблокирован", assistant["content"])
         self.assertNotIn("print('реализация')", assistant["content"])
         self.assertEqual(completed_exchanges(result["messages"]), [])
+
+    def test_informational_answer_does_not_need_to_complete_planning(self):
+        provider = IncompleteAnalysisProvider()
+        self.app.extensions["chat_agent"].provider = provider
+        conversation = self.create_conversation()
+        response = self.client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Что надеть при такой погоде?", "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(response.status_code, 200)
+        result = response.get_json()["conversation"]
+        assistant = result["messages"][-1]
+        self.assertEqual(assistant["technical"]["request_status"], "completed")
+        self.assertIn("лёгкая куртка", assistant["content"])
+        audit = assistant["technical"]["policy_audit"]
+        self.assertTrue(audit["accepted"])
+        self.assertFalse(audit["validator_allowed"])
+        self.assertFalse(audit["stage_complete"])
+        self.assertEqual(result["task_state"]["stage"], "planning")
 
     def test_blocked_answer_can_be_regenerated_without_duplicate_user_message(self):
         provider = MislabeledImplementationProvider()

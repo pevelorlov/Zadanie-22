@@ -35,7 +35,7 @@ def main() -> None:
     log_paths = configure_logging(BASE_DIR / "logs")
     from app import create_app
 
-    app = create_app()
+    app = create_app(scheduler_autostart=True, orchestration_autostart=True)
 
     port = find_available_port()
     url = f"http://127.0.0.1:{port}"
@@ -56,6 +56,12 @@ def main() -> None:
     except KeyboardInterrupt:
         logger.info("Получена команда остановки приложения")
     finally:
+        app.extensions["scheduler_service"].stop()
+        app.extensions["scheduler_mcp_manager"].stop()
+        app.extensions["weather_mcp_manager"].stop()
+        app.extensions["mediawiki_mcp_manager"].stop()
+        app.extensions["worldbank_mcp_manager"].stop()
+        app.extensions["mcp_manager"].stop()
         app.extensions["whisper_service"].stop()
         logger.info("Приложение остановлено")
 
