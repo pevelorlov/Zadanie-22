@@ -66,6 +66,9 @@ from context_manager import (
 from logging_setup import reset_request_id, set_request_id
 from invariants import InvariantStore
 from memory_manager import MemoryManager
+from document_index import RAG_STRATEGIES, RagIndexService, build_rag_context
+from document_index.evaluations import RagEvaluationStore
+from mcp_control import PersistentFeatureControl
 from mcp_manager import (
     MCPManager,
     MediaWikiMCPManager,
@@ -147,6 +150,34 @@ def requests_file_export(text: str) -> bool:
     return any(re.search(pattern, lowered, flags=re.DOTALL) for pattern in _FILE_EXPORT_PATTERNS)
 
 
+def normalize_rag_options(value: Any) -> dict[str, Any]:
+    raw = value if isinstance(value, dict) else {}
+    enabled = raw.get("enabled") is True
+    strategy = str(raw.get("strategy") or "structural").strip().lower()
+    if strategy not in RAG_STRATEGIES:
+        raise ValueError("Стратегия RAG должна быть fixed, structural или combined.")
+    try:
+        top_k = int(raw.get("top_k", 5))
+    except (TypeError, ValueError) as error:
+        raise ValueError("Top-K для RAG должен быть целым числом.") from error
+    if not 1 <= top_k <= 20:
+        raise ValueError("Top-K для RAG должен быть от 1 до 20.")
+    return {"enabled": enabled, "strategy": strategy, "top_k": top_k}
+
+
+def rag_snapshot(options: dict[str, Any], retrieval: dict | None = None) -> dict[str, Any]:
+    snapshot = deepcopy(options)
+    if retrieval:
+        snapshot.update({
+            "run_id": retrieval.get("run_id"),
+            "query": retrieval.get("query"),
+            "chunks": deepcopy(retrieval.get("chunks") or []),
+        })
+    else:
+        snapshot["chunks"] = []
+    return snapshot
+
+
 def unique_report_path(workspace: Path, requested_path: Any) -> Path:
     """Создаёт уникальный Markdown-путь строго внутри workspace/reports."""
     reports_dir = (workspace.resolve() / "reports").resolve()
@@ -174,6 +205,7 @@ def create_app(
     mediawiki_mcp_manager: StdioMCPManager | None = None,
     worldbank_mcp_manager: StdioMCPManager | None = None,
     orchestration_autostart: bool = False,
+    rag_index_service: RagIndexService | None = None,
 ) -> Flask:
     flask_app = Flask(__name__)
     flask_app.json.ensure_ascii = False
@@ -194,6 +226,13 @@ def create_app(
     mediawiki_mcp = mediawiki_mcp_manager or MediaWikiMCPManager(BASE_DIR)
     worldbank_mcp = worldbank_mcp_manager or WorldBankMCPManager(BASE_DIR)
     scheduler = scheduler_service or SchedulerService(scheduler_repository)
+    rag_index = rag_index_service or RagIndexService(
+        (BASE_DIR / "rag_documents") if data_dir is None else (storage.data_dir / "rag_documents"),
+        storage.data_dir / "rag_index.sqlite3",
+    )
+    rag_evaluations = RagEvaluationStore(storage.data_dir / "rag_evaluations.json")
+    mcp_control = PersistentFeatureControl(storage.data_dir / "mcp_control.json")
+    task_control = PersistentFeatureControl(storage.data_dir / "task_control.json")
     mcp_activity_lock = threading.RLock()
     mcp_activities: dict[str, dict[str, Any]] = {}
 
@@ -209,10 +248,26 @@ def create_app(
     flask_app.extensions["mediawiki_mcp_manager"] = mediawiki_mcp
     flask_app.extensions["worldbank_mcp_manager"] = worldbank_mcp
     flask_app.extensions["scheduler_service"] = scheduler
+    flask_app.extensions["rag_index_service"] = rag_index
+    flask_app.extensions["rag_evaluation_store"] = rag_evaluations
+    flask_app.extensions["mcp_control"] = mcp_control
+    flask_app.extensions["task_control"] = task_control
     logger.info("Flask-приложение создано | data_dir=%s", storage.data_dir)
 
     def current_profile_id() -> str:
         return _profile_override.get() or storage.active_profile_id()
+
+    def mcp_blocked_response():
+        return api_error(
+            "Все MCP принудительно отключены. Сначала нажмите «Разрешить MCP».",
+            409,
+        )
+
+    def task_control_blocked_response():
+        return api_error(
+            "Машина задач принудительно отключена. Сначала нажмите «Включить машину задач».",
+            409,
+        )
 
     def begin_mcp_activity(activity_id: str | None) -> str | None:
         if not activity_id or not re.fullmatch(r"[0-9a-f]{32}", activity_id):
@@ -302,6 +357,7 @@ def create_app(
         task_state: dict[str, Any],
         handoff_context: dict[str, Any],
         invariants: dict[str, Any],
+        rag_context: str = "",
         tool_context: dict[str, Any] | None = None,
     ) -> AgentResult:
         """Генерирует черновик и не выпускает его без независимой проверки политики."""
@@ -309,27 +365,33 @@ def create_app(
         tool_owners: dict[str, str] = {}
         created_scheduler_tasks: list[tuple[str, str]] = []
         created_report_paths: list[Path] = []
-        if weather_mcp.status().get("connected"):
+        mcp_enabled = mcp_control.is_enabled()
+        task_control_enabled = task_control.is_enabled()
+        if mcp_enabled and weather_mcp.status().get("connected"):
             for tool in weather_mcp.tools_for_model():
                 available_tools.append(tool)
                 tool_owners[tool["name"]] = "open-meteo"
-        if mediawiki_mcp.status().get("connected"):
+        if mcp_enabled and mediawiki_mcp.status().get("connected"):
             for tool in mediawiki_mcp.tools_for_model():
                 if tool["name"] in MEDIAWIKI_MODEL_TOOLS:
                     available_tools.append(tool)
                     tool_owners[tool["name"]] = "mediawiki"
-        if worldbank_mcp.status().get("connected"):
+        if mcp_enabled and worldbank_mcp.status().get("connected"):
             for tool in worldbank_mcp.tools_for_model():
                 if tool["name"] in WORLDBANK_MODEL_TOOLS:
                     available_tools.append(tool)
                     tool_owners[tool["name"]] = "worldbank"
-        if scheduler_mcp.status().get("connected") and _scheduled_tool_allowlist.get() is None:
+        if mcp_enabled and scheduler_mcp.status().get("connected") and _scheduled_tool_allowlist.get() is None:
             for tool in scheduler_mcp.tools_for_model():
                 if tool["name"] in SCHEDULER_MODEL_TOOLS:
                     available_tools.append(tool)
                     tool_owners[tool["name"]] = "scheduler"
         allowlist = _scheduled_tool_allowlist.get()
-        file_export_enabled = bool((tool_context or {}).get("enable_file_export")) and allowlist is None
+        file_export_enabled = (
+            mcp_enabled
+            and bool((tool_context or {}).get("enable_file_export"))
+            and allowlist is None
+        )
         if file_export_enabled:
             if not mcp.status().get("connected"):
                 mcp.start()
@@ -357,6 +419,8 @@ def create_app(
             available_tools = [tool for tool in available_tools if tool["name"] in allowlist]
 
         def execute_owned_tool(name: str, arguments: dict[str, Any], owner: str | None) -> dict[str, Any]:
+            if not mcp_control.is_enabled():
+                raise PermissionError("Все MCP принудительно отключены пользователем.")
             if owner == "open-meteo":
                 return weather_mcp.call_tool(name, arguments)
             if owner == "mediawiki":
@@ -460,9 +524,9 @@ def create_app(
                 summary=summary,
                 facts=facts,
                 memory_context=memory_context,
-                task_handoff_context=handoff_context,
-                task_state=task_state,
-                policy_guidance=generation_guidance(task_state, invariants) + (
+                task_handoff_context=handoff_context if task_control_enabled else {},
+                task_state=task_state if task_control_enabled else {},
+                policy_guidance=(generation_guidance(task_state, invariants) if task_control_enabled else "") + rag_context + (
                     "\n\nКОМПОЗИЦИЯ ОТЧЁТА:\n"
                     "Пользователь явно попросил сохранить результат. Сначала получи необходимые исходные данные "
                     "через доступные MCP-инструменты, затем самостоятельно проанализируй их строго по запросу "
@@ -486,6 +550,20 @@ def create_app(
             rollback_created_schedules()
             rollback_created_reports()
             raise
+        if not task_control_enabled:
+            set_mcp_activity_phase(
+                str((tool_context or {}).get("mcp_activity_id") or "") or None,
+                "completed",
+            )
+            return AgentResult(
+                content=draft_result.content,
+                reasoning_content=draft_result.reasoning_content,
+                technical={
+                    **draft_result.technical,
+                    "request_status": "completed",
+                    "task_control": {"enabled": False},
+                },
+            )
         validation = None
         validation_result = None
         accepted = False
@@ -551,6 +629,8 @@ def create_app(
 
     def automatic_event_is_authorized(conversation: dict[str, Any], event: str) -> bool:
         """Принимает автопереход только из последнего проверенного ответа текущего запуска этапа."""
+        if not task_control.is_enabled():
+            return False
         state = ensure_task_state(conversation)
         if state.get("transition_mode") != "automatic" or event not in allowed_task_events(state):
             return False
@@ -798,6 +878,125 @@ def create_app(
             "presets": preset_manager.list(),
         })
 
+    @flask_app.get("/api/rag/state")
+    def rag_state():
+        return jsonify({"ok": True, **rag_index.state()})
+
+    @flask_app.post("/api/rag/index")
+    def rag_build_index():
+        try:
+            return jsonify({"ok": True, "job": rag_index.start_build(json_body())}), 202
+        except RuntimeError as error:
+            return api_error(str(error), 409)
+        except ValueError as error:
+            return api_error(str(error), 400)
+
+    @flask_app.get("/api/rag/chunks")
+    def rag_chunks():
+        try:
+            strategy = str(request.args.get("strategy", "fixed"))
+            page = int(request.args.get("page", 1))
+            page_size = int(request.args.get("page_size", 20))
+            source = str(request.args.get("source", ""))
+            return jsonify({"ok": True, **rag_index.list_chunks(strategy, page, page_size, source)})
+        except (TypeError, ValueError) as error:
+            return api_error(str(error), 400)
+
+    @flask_app.post("/api/rag/search")
+    def rag_search():
+        try:
+            data = json_body()
+            return jsonify({"ok": True, **rag_index.search(data.get("query", ""), data.get("top_k", 5))})
+        except ValueError as error:
+            return api_error(str(error), 400)
+        except RuntimeError as error:
+            return api_error(str(error), 409)
+
+    @flask_app.get("/api/rag/evaluations")
+    def rag_evaluation_state():
+        questions_path = BASE_DIR / "docs" / "day22_control_questions.json"
+        questions = []
+        if questions_path.exists():
+            value = json.loads(questions_path.read_text(encoding="utf-8"))
+            questions = value.get("questions", []) if isinstance(value, dict) else []
+        return jsonify({"ok": True, "questions": questions, "items": rag_evaluations.list()})
+
+    @flask_app.post("/api/conversations/<conversation_id>/rag-compare")
+    def compare_rag_answers(conversation_id: str):
+        """Два изолированных LLM-вызова с одинаковыми настройками; историю не изменяет."""
+        try:
+            data = json_body()
+            conversation = accessible_conversation(conversation_id)
+            question = require_message(data.get("question"))
+            settings = AgentSettings.from_dict(data.get("settings"))
+            options = normalize_rag_options({
+                "enabled": True,
+                "strategy": data.get("strategy", "structural"),
+                "top_k": data.get("top_k", 5),
+            })
+            retrieval = rag_index.retrieve(question, options["strategy"], options["top_k"])
+            history, summary, facts, context_snapshot = request_history(conversation)
+            profile_id = current_profile_id()
+            memory_snapshot = memory_manager.context_snapshot(conversation, context_snapshot["mode"], profile_id)
+            state_snapshot = deepcopy(ensure_task_state(conversation))
+            state_snapshot["registered_artifacts"] = [
+                public_artifact(item) for item in active_artifacts(conversation)
+            ]
+            handoff_snapshot = task_handoff_context(conversation)
+            invariant_snapshot = invariant_context(conversation, profile_id)
+            common = {
+                "history": history,
+                "user_text": question,
+                "settings": settings,
+                "summary": summary,
+                "facts": facts,
+                "memory_context": memory_snapshot,
+                "task_handoff_context": handoff_snapshot,
+                "task_state": state_snapshot,
+            }
+            guidance = generation_guidance(state_snapshot, invariant_snapshot)
+            without_rag = chat_agent.reply(**common, policy_guidance=guidance)
+            with_rag = chat_agent.reply(
+                **common,
+                policy_guidance=guidance + build_rag_context(retrieval),
+            )
+            known_questions = {}
+            questions_path = BASE_DIR / "docs" / "day22_control_questions.json"
+            if questions_path.exists():
+                value = json.loads(questions_path.read_text(encoding="utf-8"))
+                known_questions = {
+                    str(item.get("id")): item for item in value.get("questions", [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+            control = known_questions.get(str(data.get("question_id") or ""))
+            item = rag_evaluations.add({
+                "conversation_id": conversation_id,
+                "question_id": (control or {}).get("id"),
+                "question": question,
+                "expectation": deepcopy((control or {}).get("expectation")),
+                "expected_sources": deepcopy((control or {}).get("expected_sources", [])),
+                "settings": settings.to_dict(),
+                "retrieval": rag_snapshot(options, retrieval),
+                "without_rag": {
+                    "content": without_rag.content,
+                    "reasoning_content": without_rag.reasoning_content,
+                    "technical": without_rag.technical,
+                },
+                "with_rag": {
+                    "content": with_rag.content,
+                    "reasoning_content": with_rag.reasoning_content,
+                    "technical": with_rag.technical,
+                },
+            })
+            return jsonify({"ok": True, "evaluation": item})
+        except (FileNotFoundError, PermissionError):
+            return api_error("Диалог не найден.", 404)
+        except (ValueError, RuntimeError, KeyError) as error:
+            return api_error(str(error).strip("'"), 400)
+        except Exception as error:
+            logger.exception("Ошибка сравнения RAG | conversation_id=%s", conversation_id)
+            return api_error(friendly_api_error(error), 502)
+
     @flask_app.get("/api/profiles")
     def list_profiles():
         return jsonify({
@@ -861,8 +1060,62 @@ def create_app(
     def mcp_status():
         return jsonify({"ok": True, "mcp": mcp.status()})
 
+    @flask_app.get("/api/task-control")
+    def task_control_status():
+        return jsonify({"ok": True, "control": task_control.state()})
+
+    @flask_app.post("/api/task-control/disable")
+    def task_control_disable():
+        control = task_control.set_enabled(False)
+        logger.info("Машина задач принудительно отключена")
+        return jsonify({"ok": True, "control": control})
+
+    @flask_app.post("/api/task-control/enable")
+    def task_control_enable():
+        control = task_control.set_enabled(True)
+        logger.info("Машина задач снова включена")
+        return jsonify({"ok": True, "control": control})
+
+    @flask_app.get("/api/mcp-control")
+    def mcp_control_status():
+        return jsonify({"ok": True, "control": mcp_control.state()})
+
+    @flask_app.post("/api/mcp-control/disable")
+    def mcp_control_disable():
+        control = mcp_control.set_enabled(False)
+        managers = {
+            "filesystem": mcp,
+            "open-meteo": weather_mcp,
+            "scheduler": scheduler_mcp,
+            "mediawiki": mediawiki_mcp,
+            "worldbank": worldbank_mcp,
+        }
+        stopped: dict[str, dict[str, Any]] = {}
+        errors: dict[str, str] = {}
+        for name, manager in managers.items():
+            try:
+                stopped[name] = manager.stop()
+            except RuntimeError as error:
+                errors[name] = str(error)
+                stopped[name] = manager.status()
+        logger.info("Все MCP принудительно отключены | errors=%s", sorted(errors))
+        return jsonify({
+            "ok": True,
+            "control": control,
+            "servers": stopped,
+            "errors": errors,
+        })
+
+    @flask_app.post("/api/mcp-control/enable")
+    def mcp_control_enable():
+        control = mcp_control.set_enabled(True)
+        logger.info("Запуск MCP снова разрешён; серверы остаются остановленными")
+        return jsonify({"ok": True, "control": control})
+
     @flask_app.post("/api/mcp/start")
     def mcp_start():
+        if not mcp_control.is_enabled():
+            return mcp_blocked_response()
         try:
             return jsonify({"ok": True, "mcp": mcp.start()})
         except RuntimeError as error:
@@ -871,6 +1124,8 @@ def create_app(
 
     @flask_app.get("/api/mcp/tools")
     def mcp_tools():
+        if not mcp_control.is_enabled():
+            return mcp_blocked_response()
         try:
             return jsonify({"ok": True, "mcp": mcp.list_tools()})
         except RuntimeError as error:
@@ -891,6 +1146,8 @@ def create_app(
 
     @flask_app.post("/api/weather-mcp/start")
     def weather_mcp_start():
+        if not mcp_control.is_enabled():
+            return mcp_blocked_response()
         try:
             status = weather_mcp.start()
             tools = weather_mcp.list_tools()
@@ -901,6 +1158,8 @@ def create_app(
 
     @flask_app.get("/api/weather-mcp/tools")
     def weather_mcp_tools():
+        if not mcp_control.is_enabled():
+            return mcp_blocked_response()
         try:
             return jsonify({"ok": True, "mcp": weather_mcp.list_tools()})
         except RuntimeError as error:
@@ -932,10 +1191,14 @@ def create_app(
             return api_error("Неизвестная операция MCP.", 404)
         try:
             if action == "start":
+                if not mcp_control.is_enabled():
+                    return mcp_blocked_response()
                 status = manager.start()
                 tools = manager.list_tools()
                 return jsonify({"ok": True, "mcp": {**status, **tools}})
             if action == "tools":
+                if not mcp_control.is_enabled():
+                    return mcp_blocked_response()
                 return jsonify({"ok": True, "mcp": manager.list_tools()})
             return jsonify({"ok": True, "mcp": manager.stop()})
         except RuntimeError as error:
@@ -978,6 +1241,8 @@ def create_app(
 
     @flask_app.get("/api/scheduler/tools")
     def scheduler_tools():
+        if not mcp_control.is_enabled():
+            return mcp_blocked_response()
         try:
             return jsonify({"ok": True, "mcp": scheduler_mcp.list_tools()})
         except RuntimeError as error:
@@ -1125,6 +1390,8 @@ def create_app(
 
     @flask_app.patch("/api/conversations/<conversation_id>/task-state")
     def update_conversation_task_state(conversation_id: str):
+        if not task_control.is_enabled():
+            return task_control_blocked_response()
         try:
             conversation = accessible_conversation(conversation_id)
             changes = json_body()
@@ -1156,6 +1423,8 @@ def create_app(
     @flask_app.post("/api/conversations/<conversation_id>/task-state/events")
     def apply_conversation_task_event(conversation_id: str):
         """Применяет событие только через серверный граф переходов."""
+        if not task_control.is_enabled():
+            return task_control_blocked_response()
         try:
             conversation = accessible_conversation(conversation_id)
             data = json_body()
@@ -1504,11 +1773,15 @@ def create_app(
             data = json_body()
             mcp_activity_id = begin_mcp_activity(str(data.get("mcp_activity_id") or "") or None)
             settings = AgentSettings.from_dict(data.get("settings"))
+            rag_options = normalize_rag_options(data.get("rag"))
             source = configuration_source(data.get("preset_id"), settings, preset_manager)
             conversation = accessible_conversation(conversation_id)
             automatic = data.get("automatic") is True
+            task_control_enabled = task_control.is_enabled()
             state = ensure_task_state(conversation)
             if automatic:
+                if not task_control_enabled:
+                    raise TaskTransitionError("Машина задач отключена; автоматическое продолжение запрещено.")
                 if state.get("transition_mode") != "automatic":
                     raise TaskTransitionError("Автопилот остановлен или переключён в ручной режим.")
                 content = automatic_continuation_text(state)
@@ -1517,10 +1790,12 @@ def create_app(
             if content.strip().lower() in {"/state", "/task-state"}:
                 conversation = append_task_state_report(conversation, content)
                 return jsonify({"ok": True, "conversation": with_token_totals(conversation)})
-            if task_is_paused(conversation):
+            if task_control_enabled and task_is_paused(conversation):
                 return paused_task_response(conversation)
         except (FileNotFoundError, PermissionError):
             return api_error("Диалог не найден.", 404)
+        except TaskTransitionError as error:
+            return api_error(str(error), 409)
         except (ValueError, KeyError) as error:
             return api_error(str(error).strip("'"), 400)
 
@@ -1552,8 +1827,10 @@ def create_app(
                 "request_status": "pending",
                 "configuration_source": source,
                 "settings": settings_snapshot,
+                "rag": rag_snapshot(rag_options),
                 "automatic_continuation": automatic,
                 "scheduled_automation": deepcopy(_automation_run_override.get()),
+                "task_control": {"enabled": task_control_enabled},
             },
         }
         append_tree_message(conversation, user_message)
@@ -1567,9 +1844,16 @@ def create_app(
         )
 
         try:
-            update_sticky_facts(conversation, chat_agent, content)
-            update_summaries(conversation, chat_agent)
-            history_for_request, active_summary_text, active_facts, context_snapshot = request_history(conversation)
+            retrieval = (
+                rag_index.retrieve(content, rag_options["strategy"], rag_options["top_k"])
+                if rag_options["enabled"] else None
+            )
+            request_rag_snapshot = rag_snapshot(rag_options, retrieval)
+            update_sticky_facts(conversation, chat_agent, content, stage_scoped=task_control_enabled)
+            update_summaries(conversation, chat_agent, stage_scoped=task_control_enabled)
+            history_for_request, active_summary_text, active_facts, context_snapshot = request_history(
+                conversation, stage_scoped=task_control_enabled,
+            )
             profile_id = user_message["author_profile_id"]
             memory_snapshot = memory_manager.context_snapshot(conversation, context_snapshot["mode"], profile_id)
             task_state_snapshot = deepcopy(ensure_task_state(conversation))
@@ -1589,6 +1873,7 @@ def create_app(
                 task_state=task_state_snapshot,
                 handoff_context=handoff_snapshot,
                 invariants=invariant_snapshot,
+                rag_context=build_rag_context(retrieval or {}),
                 tool_context={
                     "profile_id": profile_id,
                     "source_conversation_id": conversation_id,
@@ -1602,10 +1887,10 @@ def create_app(
             request_status = result.technical.get("request_status", "completed")
             assistant_message_id = uuid.uuid4().hex
             audit = result.technical.get("policy_audit", {})
-            if request_status == "completed" and task_state_snapshot.get("stage") == "planning" and audit.get("stage_complete"):
+            if task_control_enabled and request_status == "completed" and task_state_snapshot.get("stage") == "planning" and audit.get("stage_complete"):
                 ensure_task_state(conversation)["required_artifacts"] = list(audit.get("required_artifacts", []))
                 task_state_snapshot["required_artifacts"] = list(audit.get("required_artifacts", []))
-            if request_status == "completed" and task_state_snapshot.get("stage") == "execution":
+            if task_control_enabled and request_status == "completed" and task_state_snapshot.get("stage") == "execution":
                 try:
                     created_artifacts = save_response_artifacts(
                         storage.data_dir,
@@ -1629,7 +1914,8 @@ def create_app(
                         "reason": str(artifact_error),
                     })
             if (
-                request_status == "completed"
+                task_control_enabled
+                and request_status == "completed"
                 and task_state_snapshot.get("stage") == "validation"
                 and audit.get("stage_complete")
                 and audit.get("recommended_event") == "pass_validation"
@@ -1660,6 +1946,8 @@ def create_app(
                         "task_state": task_state_snapshot,
                         "task_handoff_context": handoff_snapshot,
                         "invariants": invariant_snapshot,
+                        "rag": request_rag_snapshot,
+                        "task_control": {"enabled": task_control_enabled},
                     })
                     break
             assistant_message = {
@@ -1680,7 +1968,9 @@ def create_app(
                     "task_state": task_state_snapshot,
                     "task_handoff_context": handoff_snapshot,
                     "invariants": invariant_snapshot,
+                    "rag": request_rag_snapshot,
                     "scheduled_automation": deepcopy(_automation_run_override.get()),
+                    "task_control": {"enabled": task_control_enabled},
                 },
             }
             append_tree_message(conversation, assistant_message, parent_id=user_message["id"])
@@ -1777,7 +2067,8 @@ def create_app(
         """Начинает ветку после сообщения; после user сразу генерирует новый ответ."""
         try:
             conversation = accessible_conversation(conversation_id)
-            if task_is_paused(conversation):
+            task_control_enabled = task_control.is_enabled()
+            if task_control_enabled and task_is_paused(conversation):
                 return paused_task_response(conversation)
             checkpoint_id = json_body().get("checkpoint_id")
             source_message = next(
@@ -1786,7 +2077,7 @@ def create_app(
             )
             if source_message and source_message.get("technical", {}).get("local_command"):
                 raise ValueError("Локальную команду состояния нельзя разветвить через модель.")
-            if source_message:
+            if task_control_enabled and source_message:
                 source_snapshot = source_message.get("technical", {}).get("task_state", {})
                 current_state = ensure_task_state(conversation)
                 stale_checkpoint = (
@@ -1809,8 +2100,8 @@ def create_app(
             source = technical.get("configuration_source") or {
                 "type": "custom", "preset_id": None, "preset_name": None,
             }
-            update_summaries(conversation, chat_agent)
-            history, summary, facts, snapshot = request_history(conversation)
+            update_summaries(conversation, chat_agent, stage_scoped=task_control_enabled)
+            history, summary, facts, snapshot = request_history(conversation, stage_scoped=task_control_enabled)
             profile_id = checkpoint.get("author_profile_id") or conversation.get("owner_profile_id") or current_profile_id()
             memory_snapshot = memory_manager.context_snapshot(conversation, snapshot["mode"], profile_id)
             task_state_snapshot = deepcopy(ensure_task_state(conversation))
@@ -1863,6 +2154,7 @@ def create_app(
                     "task_state": task_state_snapshot,
                     "task_handoff_context": handoff_snapshot,
                     "invariants": invariant_snapshot,
+                    "task_control": {"enabled": task_control_enabled},
                 },
             }
             append_tree_message(conversation, assistant, parent_id=checkpoint["id"])
@@ -1967,7 +2259,7 @@ def create_app(
             return api_error("Пресет не найден.", 404)
 
     def run_scheduled_automation(task: dict[str, Any], run: dict[str, Any]) -> dict[str, Any]:
-        if "open-meteo" in task.get("mcp_servers", []):
+        if mcp_control.is_enabled() and "open-meteo" in task.get("mcp_servers", []):
             weather_mcp.start()
             weather_mcp.list_tools()
         profile_token = _profile_override.set(str(task["owner_profile_id"]))
@@ -1999,10 +2291,11 @@ def create_app(
 
     scheduler.set_runner(run_scheduled_automation)
     if scheduler_autostart:
-        scheduler_mcp.start()
-        scheduler_mcp.list_tools()
+        if mcp_control.is_enabled():
+            scheduler_mcp.start()
+            scheduler_mcp.list_tools()
         scheduler.start()
-    if orchestration_autostart:
+    if orchestration_autostart and mcp_control.is_enabled():
         for manager in (mediawiki_mcp, worldbank_mcp):
             manager.start()
             manager.list_tools()
@@ -2130,12 +2423,14 @@ app = create_app(voice_service=WhisperService(BASE_DIR, autostart=False), schedu
 
 if __name__ == "__main__":
     app.extensions["whisper_service"].start()
-    app.extensions["scheduler_mcp_manager"].start()
-    app.extensions["scheduler_mcp_manager"].list_tools()
+    if app.extensions["mcp_control"].is_enabled():
+        app.extensions["scheduler_mcp_manager"].start()
+        app.extensions["scheduler_mcp_manager"].list_tools()
     app.extensions["scheduler_service"].start()
-    for extension_name in ("mediawiki_mcp_manager", "worldbank_mcp_manager"):
-        app.extensions[extension_name].start()
-        app.extensions[extension_name].list_tools()
+    if app.extensions["mcp_control"].is_enabled():
+        for extension_name in ("mediawiki_mcp_manager", "worldbank_mcp_manager"):
+            app.extensions[extension_name].start()
+            app.extensions[extension_name].list_tools()
     logger.info("Приложение запущено напрямую через app.py | url=http://127.0.0.1:5000")
     print(f"Общий журнал: {_direct_log_paths['app']}")
     print(f"Журнал ошибок: {_direct_log_paths['errors']}")

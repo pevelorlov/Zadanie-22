@@ -13,6 +13,8 @@ const ui = {
   presetSelect: $("#preset-select"), settingsToggle: $("#settings-toggle"), settingsPanel: $("#settings-panel"), settingsClose: $("#settings-close"),
   settingsSummary: $("#settings-summary"), resetCustom: $("#reset-custom"), saveAsPreset: $("#save-as-preset"), presetsButton: $("#presets-button"),
   requestStatus: $("#request-status"), tokenOverview: $("#token-overview"),
+  mcpControlStatus: $("#mcp-control-status"), mcpControlMessage: $("#mcp-control-message"),
+  mcpDisableAll: $("#mcp-disable-all"), mcpEnableAll: $("#mcp-enable-all"),
   mcpStart: $("#mcp-start"), mcpTools: $("#mcp-tools"), mcpStop: $("#mcp-stop"),
   mcpStatus: $("#mcp-status"), mcpMessage: $("#mcp-message"), mcpDetails: $("#mcp-details"), mcpToolList: $("#mcp-tool-list"),
   weatherMcpStart: $("#weather-mcp-start"), weatherMcpTools: $("#weather-mcp-tools"), weatherMcpStop: $("#weather-mcp-stop"),
@@ -23,6 +25,7 @@ const ui = {
   worldbankMcpStatus: $("#worldbank-mcp-status"), worldbankMcpMessage: $("#worldbank-mcp-message"), worldbankMcpDetails: $("#worldbank-mcp-details"), worldbankMcpToolList: $("#worldbank-mcp-tool-list"),
   contextMode: $("#context-mode"), contextStatus: $("#context-status"), contextMetrics: $("#context-metrics"),
   taskDescription: $("#task-description"), taskStage: $("#task-stage"), taskCurrentStep: $("#task-current-step"),
+  taskControlDisable: $("#task-control-disable"), taskControlEnable: $("#task-control-enable"), taskControlMessage: $("#task-control-message"),
   taskTransitionMode: $("#task-transition-mode"), taskAutopilotStop: $("#task-autopilot-stop"),
   taskExpectedAction: $("#task-expected-action"), taskPlan: $("#task-plan"), taskStateSave: $("#task-state-save"),
   taskActivityToggle: $("#task-activity-toggle"), taskActivityBadge: $("#task-activity-badge"), taskStateNote: $("#task-state-note"),
@@ -62,6 +65,23 @@ const ui = {
   schedulerReset: $("#scheduler-reset"), schedulerSave: $("#scheduler-save"), schedulerShowTools: $("#scheduler-show-tools"),
   schedulerMcpTools: $("#scheduler-mcp-tools"), schedulerReadAll: $("#scheduler-read-all"), schedulerTaskList: $("#scheduler-task-list"),
   schedulerRunsCount: $("#scheduler-runs-count"), schedulerRunList: $("#scheduler-run-list"),
+  chatViewButton: $("#chat-view-button"), ragViewButton: $("#rag-view-button"), ragPanel: $("#rag-panel"),
+  ragHeaderStatus: $("#rag-header-status"), ragRefresh: $("#rag-refresh"), ragFolder: $("#rag-folder"), ragFiles: $("#rag-files"), ragModel: $("#rag-model"),
+  ragFixedSize: $("#rag-fixed-size"), ragFixedOverlap: $("#rag-fixed-overlap"), ragStructuralSize: $("#rag-structural-size"), ragStructuralOverlap: $("#rag-structural-overlap"),
+  ragBuild: $("#rag-build"), ragBuildNote: $("#rag-build-note"), ragProgressTitle: $("#rag-progress-title"), ragProgressCount: $("#rag-progress-count"),
+  ragProgressBar: $("#rag-progress-bar"), ragCurrentFile: $("#rag-current-file"), ragErrors: $("#rag-errors"),
+  ragFixedTotal: $("#rag-fixed-total"), ragStructuralTotal: $("#rag-structural-total"), ragFixedStats: $("#rag-fixed-stats"), ragStructuralStats: $("#rag-structural-stats"),
+  ragFixedSource: $("#rag-fixed-source"), ragStructuralSource: $("#rag-structural-source"), ragFixedChunks: $("#rag-fixed-chunks"), ragStructuralChunks: $("#rag-structural-chunks"),
+  ragFixedPrev: $("#rag-fixed-prev"), ragFixedNext: $("#rag-fixed-next"), ragStructuralPrev: $("#rag-structural-prev"), ragStructuralNext: $("#rag-structural-next"),
+  ragFixedPage: $("#rag-fixed-page"), ragStructuralPage: $("#rag-structural-page"), ragFixedDetail: $("#rag-fixed-detail"), ragStructuralDetail: $("#rag-structural-detail"),
+  ragSearchForm: $("#rag-search-form"), ragSearchQuery: $("#rag-search-query"), ragSearchTopK: $("#rag-search-top-k"), ragSearchMessage: $("#rag-search-message"),
+  ragFixedResults: $("#rag-fixed-results"), ragStructuralResults: $("#rag-structural-results"),
+  chatRagEnabled: $("#chat-rag-enabled"), chatRagStrategy: $("#chat-rag-strategy"), chatRagTopK: $("#chat-rag-top-k"),
+  ragCompareForm: $("#rag-compare-form"), ragControlQuestion: $("#rag-control-question"), ragCompareQuestion: $("#rag-compare-question"),
+  ragCompareStrategy: $("#rag-compare-strategy"), ragCompareTopK: $("#rag-compare-top-k"), ragCompareSubmit: $("#rag-compare-submit"),
+  ragControlExpectation: $("#rag-control-expectation"), ragCompareMessage: $("#rag-compare-message"),
+  ragWithoutUsage: $("#rag-without-usage"), ragWithUsage: $("#rag-with-usage"), ragWithoutAnswer: $("#rag-without-answer"), ragWithAnswer: $("#rag-with-answer"),
+  ragCompareSources: $("#rag-compare-sources"), ragEvaluationCount: $("#rag-evaluation-count"), ragControlList: $("#rag-control-list"), ragEvaluationHistory: $("#rag-evaluation-history"),
 };
 
 let appState = { conversations: [], projects: [], profiles: [], activeProfileId: null, presets: [], defaults: null, provider: null };
@@ -79,6 +99,10 @@ let audioChunks = [];
 let recordingTimer = null;
 let voiceBusy = false;
 let voiceSubmitAfterTranscription = false;
+let mcpControlState = { enabled: true, updated_at: null };
+let mcpControlBusy = false;
+let taskControlState = { enabled: true, updated_at: null };
+let taskControlBusy = false;
 let mcpState = { phase: "stopped", connected: false, message: "MCP-сервер не запущен.", server: {} };
 let mcpBusy = false;
 let mcpActiveAction = null;
@@ -91,6 +115,11 @@ const orchestrationMcp = {
 };
 let invariantContext = { bundle: { layers: {}, rules: [] }, sets: { user: [], project: [], task: [] } };
 let schedulerState = { scheduler: {}, mcp: {}, tasks: [], runs: [], summary: { unread_count: 0 } };
+let ragState = null;
+let ragPollTimer = null;
+let ragLoadedRunId = null;
+let ragEvaluationState = { questions: [], items: [] };
+const ragPages = { fixed: 1, structural: 1 };
 
 start().catch(showFatal);
 
@@ -102,14 +131,116 @@ async function start() {
   renderPresetSelect();
   applySettings(appState.defaults);
   renderConversationList();
+  await refreshTaskControlStatus().catch((error) => renderTaskControlError(error));
   if (appState.conversations.length) await openConversation(appState.conversations[0].id);
   else renderEmptyWorkspace();
   startVoiceStatusPolling();
+  await refreshMcpControlStatus().catch((error) => renderMcpControlError(error));
   refreshMcpStatus().catch((error) => renderMcpError(error));
   refreshWeatherMcpStatus().catch((error) => renderWeatherMcpError(error));
   Object.keys(orchestrationMcp).forEach((name) => refreshOrchestrationMcpStatus(name).catch((error) => renderOrchestrationMcpError(name, error)));
   refreshSchedulerState().catch(() => {});
   window.setInterval(() => refreshSchedulerState().catch(() => {}), 10000);
+}
+
+function taskMachineEnabled() {
+  return taskControlState.enabled === true;
+}
+
+async function refreshTaskControlStatus() {
+  const data = await api("/api/task-control");
+  taskControlState = data.control;
+  renderTaskControlState();
+}
+
+function renderTaskControlState() {
+  const enabled = taskMachineEnabled();
+  ui.taskControlMessage.textContent = enabled
+    ? "Машина задач включена: этапы, проверка и автопилот применяются ко всем диалогам."
+    : "Машина задач отключена: обычный чат работает без этапов, валидатора и автопилота; сохранённое состояние не удалено.";
+  ui.taskControlMessage.className = "task-control-message";
+  ui.taskControlDisable.disabled = taskControlBusy || !enabled;
+  ui.taskControlEnable.disabled = taskControlBusy || enabled;
+  ui.taskControlDisable.textContent = taskControlBusy && enabled ? "Отключаем…" : "Отключить машину задач";
+  ui.taskControlEnable.textContent = taskControlBusy && !enabled ? "Включаем…" : "Включить машину задач";
+  if (activeConversation) renderTaskState();
+}
+
+function renderTaskControlError(error) {
+  ui.taskControlMessage.textContent = error.message || String(error);
+  ui.taskControlMessage.className = "task-control-message error";
+}
+
+async function setTaskControl(enabled) {
+  if (taskControlBusy) return;
+  taskControlBusy = true;
+  if (!enabled) autopilotStopRequested = true;
+  renderTaskControlState();
+  try {
+    const action = enabled ? "enable" : "disable";
+    const data = await api(`/api/task-control/${action}`, { method: "POST", body: {} });
+    taskControlState = data.control;
+  } catch (error) {
+    renderTaskControlError(error);
+  } finally {
+    taskControlBusy = false;
+    renderTaskControlState();
+  }
+}
+
+function mcpAllowed() {
+  return mcpControlState.enabled === true;
+}
+
+async function refreshMcpControlStatus() {
+  const data = await api("/api/mcp-control");
+  mcpControlState = data.control;
+  renderMcpControlState();
+}
+
+function renderMcpControlState() {
+  const enabled = mcpAllowed();
+  ui.mcpControlStatus.textContent = enabled ? "Разрешены" : "Заблокированы";
+  ui.mcpControlStatus.className = `mcp-status ${enabled ? "running" : "stopped"}`;
+  ui.mcpControlMessage.textContent = enabled
+    ? "MCP разрешены. Остановленные серверы запускаются вручную или штатной автоматикой."
+    : "Блокировка активна: модель не получает MCP-инструменты, автоматический запуск запрещён.";
+  ui.mcpControlMessage.className = "mcp-message";
+  ui.mcpDisableAll.disabled = mcpControlBusy || !enabled;
+  ui.mcpEnableAll.disabled = mcpControlBusy || enabled;
+  ui.mcpDisableAll.textContent = mcpControlBusy && enabled ? "Отключаем…" : "Отключить все MCP";
+  ui.mcpEnableAll.textContent = mcpControlBusy && !enabled ? "Разрешаем…" : "Разрешить MCP";
+  renderMcpState();
+  renderWeatherMcpState();
+  Object.keys(orchestrationMcp).forEach(renderOrchestrationMcpState);
+  renderScheduler();
+}
+
+function renderMcpControlError(error) {
+  ui.mcpControlMessage.textContent = error.message || String(error);
+  ui.mcpControlMessage.className = "mcp-message error";
+}
+
+async function setMcpControl(enabled) {
+  if (mcpControlBusy) return;
+  mcpControlBusy = true;
+  renderMcpControlState();
+  try {
+    const action = enabled ? "enable" : "disable";
+    const data = await api(`/api/mcp-control/${action}`, { method: "POST", body: {} });
+    mcpControlState = data.control;
+    await Promise.all([
+      refreshMcpStatus(),
+      refreshWeatherMcpStatus(),
+      ...Object.keys(orchestrationMcp).map(refreshOrchestrationMcpStatus),
+      refreshSchedulerState(),
+    ]);
+  } catch (error) {
+    renderMcpControlError(error);
+  } finally {
+    mcpControlBusy = false;
+    renderMcpControlState();
+  }
 }
 
 async function refreshSchedulerState() {
@@ -125,6 +256,7 @@ function renderScheduler() {
   const running = schedulerState.scheduler?.running === true;
   ui.schedulerRuntimeStatus.textContent = running ? "Работает" : "Остановлен";
   ui.schedulerRuntimeStatus.className = `mcp-status ${running ? "running" : "stopped"}`;
+  ui.schedulerShowTools.disabled = !mcpAllowed();
   const counts = schedulerState.summary || {};
   const cards = [
     ["Заданий", counts.tasks_total || 0],
@@ -298,8 +430,8 @@ function renderWeatherMcpState() {
   ui.weatherMcpMessage.textContent = weatherMcpState.message || "";
   ui.weatherMcpMessage.className = `mcp-message${weatherMcpState.error ? " error" : ""}`;
   const active = weatherMcpState.connected === true;
-  ui.weatherMcpStart.disabled = weatherMcpBusy || active || phase === "starting" || phase === "stopping";
-  ui.weatherMcpTools.disabled = weatherMcpBusy || !active;
+  ui.weatherMcpStart.disabled = !mcpAllowed() || weatherMcpBusy || active || phase === "starting" || phase === "stopping";
+  ui.weatherMcpTools.disabled = !mcpAllowed() || weatherMcpBusy || !active;
   ui.weatherMcpStop.disabled = weatherMcpBusy || !active;
   ui.weatherMcpStart.textContent = weatherMcpActiveAction === "start" ? "Запускаем…" : "Запустить MCP";
   ui.weatherMcpTools.textContent = weatherMcpActiveAction === "tools" ? "Получаем…" : "Получить инструменты";
@@ -385,8 +517,8 @@ function renderOrchestrationMcpState(name) {
   elements.message.textContent = state.message || "";
   elements.message.className = `mcp-message${state.error ? " error" : ""}`;
   const active = state.connected === true;
-  elements.start.disabled = record.busy || active || phase === "starting" || phase === "stopping";
-  elements.tools.disabled = record.busy || !active;
+  elements.start.disabled = !mcpAllowed() || record.busy || active || phase === "starting" || phase === "stopping";
+  elements.tools.disabled = !mcpAllowed() || record.busy || !active;
   elements.stop.disabled = record.busy || !active;
   elements.start.textContent = record.action === "start" ? "Запускаем…" : "Запустить MCP";
   elements.tools.textContent = record.action === "tools" ? "Получаем…" : "Получить инструменты";
@@ -463,8 +595,8 @@ function renderMcpState() {
   ui.mcpMessage.textContent = mcpState.message || "";
   ui.mcpMessage.className = `mcp-message${mcpState.error ? " error" : ""}`;
   const active = mcpState.connected === true;
-  ui.mcpStart.disabled = mcpBusy || active || phase === "starting" || phase === "stopping";
-  ui.mcpTools.disabled = mcpBusy || !active;
+  ui.mcpStart.disabled = !mcpAllowed() || mcpBusy || active || phase === "starting" || phase === "stopping";
+  ui.mcpTools.disabled = !mcpAllowed() || mcpBusy || !active;
   ui.mcpStop.disabled = mcpBusy || !active;
   ui.mcpStart.textContent = mcpActiveAction === "start" ? "Запускаем…" : "Запустить MCP";
   ui.mcpTools.textContent = mcpActiveAction === "tools" ? "Получаем…" : "Получить инструменты";
@@ -833,6 +965,13 @@ function renderMessages() {
       : (localCommand ? "Состояние задачи · сервер" : `DeepSeek · профиль «${profileName}»`);
     element.querySelector("time").textContent = formatDate(message.created_at, true);
     element.querySelector(".message-text").textContent = message.content;
+    const ragAudit = message.technical?.rag;
+    if (ragAudit?.enabled) {
+      const badge = document.createElement("div");
+      badge.className = "rag-message-audit";
+      badge.textContent = `RAG · ${ragAudit.strategy} · ${Array.isArray(ragAudit.chunks) ? ragAudit.chunks.length : 0} чанков · top-K ${ragAudit.top_k}`;
+      element.querySelector(".message-text").after(badge);
+    }
     const audit = message.technical?.policy_audit;
     if (message.role === "assistant" && audit) {
       const auditNode = document.createElement("div");
@@ -992,7 +1131,7 @@ function conversationMessages() {
 }
 
 function taskIsPaused() {
-  return activeConversation?.task_state?.activity === "paused";
+  return taskMachineEnabled() && activeConversation?.task_state?.activity === "paused";
 }
 
 function taskStateBody() {
@@ -1023,21 +1162,26 @@ function renderTaskState() {
   ui.taskExpectedAction.value = state.expected_action || "";
   ui.taskPlan.value = state.plan || "";
   ui.taskStage.disabled = true;
-  const paused = state.activity === "paused";
-  ui.taskActivityBadge.textContent = paused ? "Приостановлена" : "Активна";
+  const enabled = taskMachineEnabled();
+  const paused = enabled && state.activity === "paused";
+  ui.taskActivityBadge.textContent = enabled ? (paused ? "Приостановлена" : "Активна") : "Отключена глобально";
   ui.taskActivityBadge.classList.toggle("paused", paused);
+  ui.taskActivityBadge.classList.toggle("disabled", !enabled);
   ui.taskActivityToggle.textContent = paused ? "Продолжить" : "Приостановить";
-  ui.taskStateNote.textContent = paused
+  ui.taskStateNote.textContent = !enabled
+    ? "Сохранённые этап, план и история доступны для просмотра, но не влияют на ответы."
+    : paused
     ? "Выполнение и переходы заблокированы. Продолжение восстановит тот же этап и шаг."
     : (state.stage === "done"
       ? "Жизненный цикл завершён: переходов к следующему этапу нет."
       : state.transition_mode === "automatic"
       ? (autopilotRunning ? "Автопилот выполняет цепочку этапов…" : "Автопилот продолжит работу после завершённого ответа этапа.")
       : "Переход выполняется вручную только разрешённой кнопкой.");
-  ui.taskAutopilotStop.disabled = state.transition_mode !== "automatic" && !autopilotRunning;
+  ui.taskAutopilotStop.disabled = !enabled || (state.transition_mode !== "automatic" && !autopilotRunning);
   renderTaskTransitionActions(state);
   renderTaskTransitionHistory(state.transition_history || []);
   renderTaskHandoffs(state);
+  setTaskStateControlsDisabled(sending);
   setSendingState(sending);
 }
 
@@ -1075,6 +1219,12 @@ function renderTaskHandoffs(state) {
 
 function renderTaskTransitionActions(state) {
   ui.taskTransitionActions.replaceChildren();
+  if (!taskMachineEnabled()) {
+    const note = document.createElement("small");
+    note.textContent = "Переходы недоступны, пока машина задач отключена.";
+    ui.taskTransitionActions.append(note);
+    return;
+  }
   if (state.transition_mode === "automatic") {
     const note = document.createElement("small");
     note.textContent = "Переходы выполняет автопилот после независимой проверки завершённости этапа.";
@@ -1106,14 +1256,15 @@ function renderTaskTransitionHistory(history) {
 }
 
 function setTaskStateControlsDisabled(disabled) {
+  const locked = disabled || !taskMachineEnabled();
   [ui.taskDescription, ui.taskTransitionMode, ui.taskCurrentStep, ui.taskExpectedAction, ui.taskPlan, ui.taskStateSave, ui.taskActivityToggle, ui.taskStateShow]
-    .forEach((control) => { control.disabled = disabled; });
+    .forEach((control) => { control.disabled = locked; });
   ui.taskStage.disabled = true;
-  ui.taskTransitionActions.querySelectorAll("button").forEach((button) => { button.disabled = disabled; });
+  ui.taskTransitionActions.querySelectorAll("button").forEach((button) => { button.disabled = locked; });
 }
 
 async function saveTaskState() {
-  if (!activeConversation || sending) return;
+  if (!activeConversation || sending || !taskMachineEnabled()) return;
   const enablingAutopilot = activeConversation.task_state?.transition_mode !== "automatic" && ui.taskTransitionMode.value === "automatic";
   ui.taskStateSave.disabled = true; ui.taskActivityToggle.disabled = true; ui.error.textContent = "";
   let saved = false;
@@ -1138,7 +1289,7 @@ function toggleTaskActivity() {
 }
 
 async function applyTaskEvent(event, { automatic = false } = {}) {
-  if (!activeConversation || sending) return;
+  if (!activeConversation || sending || !taskMachineEnabled()) return;
   sending = true;
   ui.error.textContent = "";
   setSendingState(true);
@@ -1456,6 +1607,14 @@ function readSettings() {
   };
 }
 
+function readChatRagOptions() {
+  return {
+    enabled: ui.chatRagEnabled.checked,
+    strategy: ui.chatRagStrategy.value,
+    top_k: Number(ui.chatRagTopK.value),
+  };
+}
+
 function updateSettingsSummary() {
   if (!appState.defaults) return;
   const value = readSettings();
@@ -1503,7 +1662,7 @@ async function sendMessageContent(content, { automatic = false } = {}) {
     }
   }, 350);
   try {
-    const data = await api(`/api/conversations/${activeConversation.id}/messages`, { method: "POST", body: { content, automatic, mcp_activity_id: activityId, preset_id: selectedPresetId || null, settings: readSettings() } });
+    const data = await api(`/api/conversations/${activeConversation.id}/messages`, { method: "POST", body: { content, automatic, mcp_activity_id: activityId, preset_id: selectedPresetId || null, settings: readSettings(), rag: readChatRagOptions() } });
     activeConversation = data.conversation; ui.input.value = ""; resizeInput(); await refreshState(); renderMessages(); ui.chatTitle.value = activeConversation.title;
     return true;
   } catch (error) {
@@ -1517,6 +1676,7 @@ async function sendMessageContent(content, { automatic = false } = {}) {
 }
 
 function automaticDecision() {
+  if (!taskMachineEnabled()) return null;
   const state = activeConversation?.task_state || {};
   if (state.transition_mode !== "automatic" || state.activity === "paused" || state.stage === "done") return null;
   const messages = Array.isArray(activeConversation?.visible_messages) ? activeConversation.visible_messages : [];
@@ -1536,7 +1696,7 @@ function automaticPrompt() {
 }
 
 async function setTransitionMode(mode) {
-  if (!activeConversation) return;
+  if (!activeConversation || !taskMachineEnabled()) return;
   const data = await api(`/api/conversations/${activeConversation.id}/task-state`, {
     method: "PATCH", body: { transition_mode: mode },
   });
@@ -1546,7 +1706,7 @@ async function setTransitionMode(mode) {
 }
 
 async function runAutomaticLifecycle() {
-  if (autopilotRunning || activeConversation?.task_state?.transition_mode !== "automatic") return;
+  if (!taskMachineEnabled() || autopilotRunning || activeConversation?.task_state?.transition_mode !== "automatic") return;
   if (autopilotStopRequested) {
     await setTransitionMode("manual");
     return;
@@ -1580,6 +1740,7 @@ async function runAutomaticLifecycle() {
 }
 
 async function stopAutopilot() {
+  if (!taskMachineEnabled()) return;
   autopilotStopRequested = true;
   ui.taskAutopilotStop.disabled = true;
   ui.taskStateNote.textContent = sending
@@ -2121,6 +2282,292 @@ function showMemorySnapshot(snapshot) {
   ui.memorySnapshotDialog.showModal();
 }
 
+function setWorkspaceView(view) {
+  const rag = view === "rag";
+  document.body.classList.toggle("rag-mode", rag);
+  ui.ragPanel.hidden = !rag;
+  ui.chatViewButton.classList.toggle("active", !rag);
+  ui.ragViewButton.classList.toggle("active", rag);
+  ui.chatViewButton.setAttribute("aria-selected", String(!rag));
+  ui.ragViewButton.setAttribute("aria-selected", String(rag));
+  if (rag) Promise.all([loadRagState(), loadRagEvaluationState()]).catch(renderRagFailure);
+}
+
+async function loadRagState() {
+  const previousRun = ragState?.latest_run?.id || null;
+  ragState = await api("/api/rag/state");
+  renderRagState();
+  const currentRun = ragState.latest_run?.id || null;
+  if (currentRun && (currentRun !== previousRun || currentRun !== ragLoadedRunId)) {
+    ragPages.fixed = 1; ragPages.structural = 1; ragLoadedRunId = currentRun;
+    await Promise.all([loadRagChunks("fixed"), loadRagChunks("structural")]);
+  }
+  window.clearTimeout(ragPollTimer);
+  if (ragState.job?.running) ragPollTimer = window.setTimeout(() => loadRagState().catch(renderRagFailure), 900);
+}
+
+function renderRagState() {
+  if (!ragState) return;
+  ui.ragFolder.textContent = ragState.documents_dir || "";
+  ui.ragModel.textContent = ragState.model_name || "";
+  renderRagFiles(ragState.files || []);
+  renderRagJob(ragState.job || {});
+  renderRagRun(ragState.latest_run);
+  populateRagSources(ragState.sources || []);
+}
+
+function renderRagFiles(files) {
+  ui.ragFiles.replaceChildren();
+  if (!files.length) {
+    const empty = document.createElement("div"); empty.className = "rag-empty";
+    empty.textContent = "Папка пуста. Добавьте PDF, DOCX, TXT, MD или HTML и обновите список.";
+    ui.ragFiles.append(empty); return;
+  }
+  files.forEach((file) => {
+    const row = document.createElement("div"); row.className = "rag-file-row";
+    const name = document.createElement("strong"); name.textContent = file.source;
+    const type = document.createElement("span"); type.textContent = file.extension.replace(".", "").toUpperCase();
+    const size = document.createElement("span"); size.textContent = formatBytes(file.size_bytes);
+    row.append(name, type, size); ui.ragFiles.append(row);
+  });
+}
+
+function renderRagJob(job) {
+  const total = Number(job.total || 0); const processed = Number(job.processed || 0);
+  const percent = total > 0 ? Math.min(100, Math.round(processed * 100 / total)) : 0;
+  ui.ragProgressTitle.textContent = job.message || "Индексация не запущена";
+  ui.ragProgressCount.textContent = `${processed} / ${total}`;
+  ui.ragProgressBar.style.width = `${percent}%`;
+  ui.ragCurrentFile.textContent = job.current_file ? `Текущий файл: ${job.current_file}` : "";
+  ui.ragBuild.disabled = job.running === true;
+  ui.ragHeaderStatus.className = `rag-status ${job.phase || "idle"}`;
+  if (job.running) ui.ragHeaderStatus.textContent = "Индексация выполняется";
+  else if (job.phase === "error") ui.ragHeaderStatus.textContent = "Ошибка индексации";
+  else if (ragState?.latest_run) ui.ragHeaderStatus.textContent = "Индекс готов";
+  else ui.ragHeaderStatus.textContent = "Индекс не построен";
+  const errors = job.errors || [];
+  ui.ragErrors.hidden = errors.length === 0;
+  ui.ragErrors.replaceChildren(...errors.map((item) => {
+    const row = document.createElement("div"); row.textContent = `${item.source}: ${item.error}`; return row;
+  }));
+}
+
+function renderRagRun(run) {
+  const fixed = run?.strategies?.fixed || {};
+  const structural = run?.strategies?.structural || {};
+  renderRagStats(ui.ragFixedStats, fixed);
+  renderRagStats(ui.ragStructuralStats, structural);
+  ui.ragFixedTotal.textContent = `${Number(fixed.count || 0)} чанков`;
+  ui.ragStructuralTotal.textContent = `${Number(structural.count || 0)} чанков`;
+  if (run) {
+    ui.ragBuildNote.textContent = `Последний запуск: ${formatDate(run.completed_at, true)} · ${run.document_count} документов · ${formatBytes(run.database_size_bytes)} · ${Number(run.duration_seconds || 0).toFixed(1)} с`;
+  } else {
+    ui.ragBuildNote.textContent = "Модель запускается на CPU и загружается только при индексации или поиске.";
+  }
+}
+
+function renderRagStats(container, stats) {
+  const values = [
+    ["Чанков", Number(stats.count || 0)],
+    ["Среднее", Math.round(Number(stats.average_tokens || 0))],
+    ["Минимум", Number(stats.min_tokens || 0)],
+    ["Максимум", Number(stats.max_tokens || 0)],
+  ];
+  container.replaceChildren(...values.map(([label, value]) => {
+    const card = document.createElement("div"); card.className = "rag-stat";
+    const small = document.createElement("small"); small.textContent = label;
+    const strong = document.createElement("strong"); strong.textContent = String(value);
+    card.append(small, strong); return card;
+  }));
+}
+
+function populateRagSources(sources) {
+  [ui.ragFixedSource, ui.ragStructuralSource].forEach((select) => {
+    const selected = select.value; select.replaceChildren();
+    const all = document.createElement("option"); all.value = ""; all.textContent = "Все документы"; select.append(all);
+    sources.forEach((source) => { const option = document.createElement("option"); option.value = source; option.textContent = source; select.append(option); });
+    select.value = sources.includes(selected) ? selected : "";
+  });
+}
+
+async function startRagBuild() {
+  ui.ragBuildNote.textContent = "Запускаем локальную индексацию…";
+  try {
+    const data = await api("/api/rag/index", { method: "POST", body: {
+      fixed_chunk_size: Number(ui.ragFixedSize.value), fixed_overlap: Number(ui.ragFixedOverlap.value),
+      structural_max_size: Number(ui.ragStructuralSize.value), structural_overlap: Number(ui.ragStructuralOverlap.value),
+    } });
+    ragState = { ...(ragState || {}), job: data.job };
+    renderRagJob(data.job);
+    window.clearTimeout(ragPollTimer); ragPollTimer = window.setTimeout(() => loadRagState().catch(renderRagFailure), 500);
+  } catch (error) { renderRagFailure(error); }
+}
+
+async function loadRagChunks(strategy) {
+  const source = strategy === "fixed" ? ui.ragFixedSource.value : ui.ragStructuralSource.value;
+  const data = await api(`/api/rag/chunks?strategy=${encodeURIComponent(strategy)}&page=${ragPages[strategy]}&page_size=20&source=${encodeURIComponent(source)}`);
+  renderRagChunks(strategy, data);
+}
+
+function renderRagChunks(strategy, data) {
+  const list = strategy === "fixed" ? ui.ragFixedChunks : ui.ragStructuralChunks;
+  const pageLabel = strategy === "fixed" ? ui.ragFixedPage : ui.ragStructuralPage;
+  const previous = strategy === "fixed" ? ui.ragFixedPrev : ui.ragStructuralPrev;
+  const next = strategy === "fixed" ? ui.ragFixedNext : ui.ragStructuralNext;
+  list.replaceChildren(); pageLabel.textContent = `${data.page} / ${Math.max(1, Math.ceil(data.total / data.page_size))}`;
+  previous.disabled = data.page <= 1; next.disabled = data.page * data.page_size >= data.total;
+  if (!data.items.length) { const empty = document.createElement("div"); empty.className = "rag-empty"; empty.textContent = "Чанков пока нет."; list.append(empty); return; }
+  data.items.forEach((chunk) => {
+    const control = document.createElement("button"); control.type = "button"; control.className = "rag-chunk-button";
+    const title = document.createElement("strong"); title.textContent = `#${chunk.chunk_order + 1} · ${chunk.source}`;
+    const meta = document.createElement("span"); meta.textContent = `${chunk.token_count} токенов · ${chunk.section}`;
+    control.append(title, meta); control.addEventListener("click", () => {
+      list.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button === control));
+      renderRagChunkDetail(strategy, chunk);
+    }); list.append(control);
+  });
+}
+
+function renderRagChunkDetail(strategy, chunk) {
+  const container = strategy === "fixed" ? ui.ragFixedDetail : ui.ragStructuralDetail;
+  const meta = document.createElement("dl"); meta.className = "rag-chunk-meta";
+  [["chunk_id", chunk.chunk_id], ["source", chunk.source], ["title", chunk.title], ["section", chunk.section],
+   ["page", chunk.page || "—"], ["strategy", chunk.strategy], ["tokens", chunk.token_count], ["SHA-256", chunk.text_hash]].forEach(([key, value]) => {
+    const dt = document.createElement("dt"); dt.textContent = String(key); const dd = document.createElement("dd"); dd.textContent = String(value); meta.append(dt, dd);
+  });
+  const text = document.createElement("p"); text.textContent = chunk.text; container.replaceChildren(meta, text);
+}
+
+async function runRagSearch(event) {
+  event.preventDefault(); ui.ragSearchMessage.textContent = "Выполняется локальный поиск…";
+  ui.ragFixedResults.replaceChildren(); ui.ragStructuralResults.replaceChildren();
+  try {
+    const data = await api("/api/rag/search", { method: "POST", body: { query: ui.ragSearchQuery.value, top_k: Number(ui.ragSearchTopK.value) } });
+    renderRagSearchResults(ui.ragFixedResults, data.results.fixed || []);
+    renderRagSearchResults(ui.ragStructuralResults, data.results.structural || []);
+    ui.ragSearchMessage.textContent = `Найдено по ${data.top_k} результатов в каждом индексе. DeepSeek не вызывался.`;
+  } catch (error) { ui.ragSearchMessage.textContent = error.message || String(error); }
+}
+
+function renderRagSearchResults(container, items) {
+  const list = document.createElement("div"); list.className = "rag-result-list";
+  if (!items.length) { const empty = document.createElement("div"); empty.className = "rag-empty"; empty.textContent = "Результатов нет."; list.append(empty); container.replaceChildren(list); return; }
+  items.forEach((item, index) => {
+    const card = document.createElement("article"); card.className = "rag-result";
+    const header = document.createElement("header"); const title = document.createElement("strong"); title.textContent = `${index + 1}. ${item.source}`;
+    const score = document.createElement("span"); score.textContent = Number(item.score).toFixed(4); header.append(title, score);
+    const text = document.createElement("p"); text.textContent = item.text;
+    const meta = document.createElement("small"); meta.textContent = `${item.section} · ${item.token_count} токенов · ${item.chunk_id}`;
+    card.append(header, text, meta); list.append(card);
+  }); container.replaceChildren(list);
+}
+
+async function loadRagEvaluationState() {
+  ragEvaluationState = await api("/api/rag/evaluations");
+  renderRagEvaluationState();
+}
+
+function renderRagEvaluationState() {
+  const questions = ragEvaluationState.questions || [];
+  const selected = ui.ragControlQuestion.value;
+  ui.ragControlQuestion.replaceChildren(new Option("Свой вопрос", ""));
+  questions.forEach((item, index) => ui.ragControlQuestion.add(new Option(`${index + 1}. ${item.question}`, item.id)));
+  ui.ragControlQuestion.value = questions.some((item) => item.id === selected) ? selected : "";
+  ui.ragControlList.replaceChildren();
+  questions.forEach((item, index) => {
+    const row = document.createElement("article"); row.className = "rag-control-item";
+    const title = document.createElement("strong"); title.textContent = `${index + 1}. ${item.question}`;
+    const expectation = document.createElement("span"); expectation.textContent = `Ожидание: ${item.expectation}`;
+    const sources = document.createElement("span"); sources.textContent = `Источники: ${(item.expected_sources || []).join(", ") || "не заданы"}`;
+    row.append(title, expectation, sources); ui.ragControlList.append(row);
+  });
+  const items = [...(ragEvaluationState.items || [])].reverse();
+  ui.ragEvaluationCount.textContent = `${items.length} ${plural(items.length, "прогон", "прогона", "прогонов")}`;
+  ui.ragEvaluationHistory.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement("div"); empty.className = "rag-empty"; empty.textContent = "Сравнения ещё не запускались."; ui.ragEvaluationHistory.append(empty);
+  } else {
+    items.forEach((item) => {
+      const row = document.createElement("article"); row.className = "rag-evaluation-item";
+      const title = document.createElement("strong"); title.textContent = item.question;
+      const meta = document.createElement("span"); meta.textContent = `${formatDate(item.created_at, true)} · ${item.retrieval?.strategy || "—"} · ${item.retrieval?.chunks?.length || 0} чанков`;
+      row.append(title, meta); row.addEventListener("click", () => renderRagEvaluation(item)); ui.ragEvaluationHistory.append(row);
+    });
+  }
+}
+
+function selectControlQuestion() {
+  const item = (ragEvaluationState.questions || []).find((question) => question.id === ui.ragControlQuestion.value);
+  if (!item) { ui.ragControlExpectation.hidden = true; return; }
+  ui.ragCompareQuestion.value = item.question;
+  ui.ragControlExpectation.hidden = false;
+  ui.ragControlExpectation.textContent = `Ожидание: ${item.expectation}\nИсточники: ${(item.expected_sources || []).join(", ")}`;
+}
+
+function usageLabel(value) {
+  const usage = value?.technical?.usage || {};
+  return `${number(usage.input_tokens)} вход · ${number(usage.output_tokens)} выход`;
+}
+
+function renderRagEvaluation(item) {
+  ui.ragWithoutAnswer.textContent = item.without_rag?.content || "";
+  ui.ragWithAnswer.textContent = item.with_rag?.content || "";
+  ui.ragWithoutUsage.textContent = usageLabel(item.without_rag);
+  ui.ragWithUsage.textContent = usageLabel(item.with_rag);
+  ui.ragCompareSources.replaceChildren();
+  const list = document.createElement("div"); list.className = "rag-source-list";
+  (item.retrieval?.chunks || []).forEach((chunk) => {
+    const card = document.createElement("article"); card.className = "rag-result";
+    const header = document.createElement("header");
+    const title = document.createElement("strong"); title.textContent = chunk.source;
+    const score = document.createElement("span"); score.textContent = Number(chunk.score).toFixed(4);
+    const text = document.createElement("p"); text.textContent = chunk.text;
+    const meta = document.createElement("small"); meta.textContent = `${chunk.section} · ${chunk.chunk_id}${chunk.page ? ` · стр. ${chunk.page}` : ""}`;
+    header.append(title, score); card.append(header, text, meta); list.append(card);
+  });
+  if (!list.childElementCount) { const empty = document.createElement("div"); empty.className = "rag-empty"; empty.textContent = "Чанки не сохранены."; list.append(empty); }
+  ui.ragCompareSources.append(list);
+}
+
+async function compareRagAnswers(event) {
+  event.preventDefault();
+  if (!activeConversation) { ui.ragCompareMessage.textContent = "Сначала создайте или откройте диалог."; return; }
+  ui.ragCompareSubmit.disabled = true;
+  ui.ragCompareMessage.textContent = "Выполняются два последовательных запроса DeepSeek…";
+  try {
+    const data = await api(`/api/conversations/${activeConversation.id}/rag-compare`, { method: "POST", body: {
+      question_id: ui.ragControlQuestion.value || null,
+      question: ui.ragCompareQuestion.value,
+      strategy: ui.ragCompareStrategy.value,
+      top_k: Number(ui.ragCompareTopK.value),
+      settings: readSettings(),
+    } });
+    renderRagEvaluation(data.evaluation);
+    ui.ragCompareMessage.textContent = "Сравнение выполнено и сохранено отдельно от истории чата.";
+    await loadRagEvaluationState();
+  } catch (error) {
+    ui.ragCompareMessage.textContent = error.message || String(error);
+  } finally {
+    ui.ragCompareSubmit.disabled = false;
+  }
+}
+
+function changeRagPage(strategy, delta) {
+  ragPages[strategy] = Math.max(1, ragPages[strategy] + delta);
+  loadRagChunks(strategy).catch(renderRagFailure);
+}
+
+function renderRagFailure(error) {
+  ui.ragBuildNote.textContent = error.message || String(error);
+  ui.ragHeaderStatus.className = "rag-status error"; ui.ragHeaderStatus.textContent = "Ошибка";
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0); if (bytes < 1024) return `${bytes} Б`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} МБ`;
+}
+
 async function api(url, options = {}) {
   const init = { method: options.method || "GET", headers: {} };
   if (options.body !== undefined) { init.headers["Content-Type"] = "application/json"; init.body = JSON.stringify(options.body); }
@@ -2135,6 +2582,19 @@ function showFatal(error) { ui.messages.textContent = `Не удалось за�
 function resizeInput() { ui.input.style.height = "auto"; ui.input.style.height = `${Math.min(ui.input.scrollHeight, 180)}px`; }
 
 ui.newChat.addEventListener("click", () => createConversation().catch(showError));
+ui.chatViewButton.addEventListener("click", () => setWorkspaceView("chat"));
+ui.ragViewButton.addEventListener("click", () => setWorkspaceView("rag"));
+ui.ragRefresh.addEventListener("click", () => loadRagState().catch(renderRagFailure));
+ui.ragBuild.addEventListener("click", startRagBuild);
+ui.ragFixedSource.addEventListener("change", () => { ragPages.fixed = 1; loadRagChunks("fixed").catch(renderRagFailure); });
+ui.ragStructuralSource.addEventListener("change", () => { ragPages.structural = 1; loadRagChunks("structural").catch(renderRagFailure); });
+ui.ragFixedPrev.addEventListener("click", () => changeRagPage("fixed", -1));
+ui.ragFixedNext.addEventListener("click", () => changeRagPage("fixed", 1));
+ui.ragStructuralPrev.addEventListener("click", () => changeRagPage("structural", -1));
+ui.ragStructuralNext.addEventListener("click", () => changeRagPage("structural", 1));
+ui.ragSearchForm.addEventListener("submit", runRagSearch);
+ui.ragControlQuestion.addEventListener("change", selectControlQuestion);
+ui.ragCompareForm.addEventListener("submit", compareRagAnswers);
 ui.profileSelect.addEventListener("change", () => changeActiveProfile().catch(showError));
 ui.profileCreate.addEventListener("click", () => openProfileDialog());
 ui.profileEdit.addEventListener("click", () => openProfileDialog(profileById(appState.activeProfileId)));
@@ -2146,6 +2606,10 @@ ui.newProjectCancel.addEventListener("click", () => { ui.newProjectForm.hidden =
 ui.newProjectForm.addEventListener("submit", (event) => createSidebarProject(event).catch(showError));
 ui.form.addEventListener("submit", submitMessage); ui.input.addEventListener("input", resizeInput);
 ui.voiceButton.addEventListener("click", toggleVoiceRecording);
+ui.mcpDisableAll.addEventListener("click", () => setMcpControl(false));
+ui.mcpEnableAll.addEventListener("click", () => setMcpControl(true));
+ui.taskControlDisable.addEventListener("click", () => setTaskControl(false));
+ui.taskControlEnable.addEventListener("click", () => setTaskControl(true));
 ui.mcpStart.addEventListener("click", () => runMcpAction("start"));
 ui.mcpTools.addEventListener("click", () => runMcpAction("tools"));
 ui.mcpStop.addEventListener("click", () => runMcpAction("stop"));

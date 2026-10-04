@@ -11,3 +11,5 @@ tools/whisper/source/
 tools/whisper/build-vulkan/
 tools/whisper/bin/
 /artifacts/video_3_week_6_stream/
+rag_documents/*
+!rag_documents/.gitkeep

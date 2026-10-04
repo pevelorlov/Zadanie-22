@@ -271,11 +271,11 @@ def active_summary(conversation: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def update_summaries(conversation: dict[str, Any], agent: Agent) -> list[dict[str, Any]]:
+def update_summaries(conversation: dict[str, Any], agent: Agent, *, stage_scoped: bool = True) -> list[dict[str, Any]]:
     context = ensure_context_management(conversation)
     if context["mode"] != SUMMARY_MODE:
         return []
-    exchanges = current_stage_exchanges(conversation)
+    exchanges = current_stage_exchanges(conversation) if stage_scoped else completed_exchanges(active_path_messages(conversation))
     current = active_summary(conversation)
     covered_ids = list(current.get("covered_exchange_ids", [])) if current else []
     completed_ids = [item["exchange_id"] for item in exchanges]
@@ -313,11 +313,11 @@ def update_summaries(conversation: dict[str, Any], agent: Agent) -> list[dict[st
     return created
 
 
-def request_history(conversation: dict[str, Any]) -> tuple[list[dict[str, Any]], str, list[dict[str, str]], dict[str, Any]]:
+def request_history(conversation: dict[str, Any], *, stage_scoped: bool = True) -> tuple[list[dict[str, Any]], str, list[dict[str, str]], dict[str, Any]]:
     """Собирает историю, summary/facts и снимок реально отправленной стратегии."""
     context = ensure_context_management(conversation)
     path = active_path_messages(conversation)
-    exchanges = current_stage_exchanges(conversation)
+    exchanges = current_stage_exchanges(conversation) if stage_scoped else completed_exchanges(path)
     mode = context["mode"]
     if mode == SUMMARY_MODE:
         current = active_summary(conversation)
@@ -328,7 +328,7 @@ def request_history(conversation: dict[str, Any]) -> tuple[list[dict[str, Any]],
             "mode": mode, "summary_id": current.get("id") if current else None,
             "summary_exchange_count": len(covered_ids), "verbatim_exchange_count": len(raw_exchanges),
             "keep_recent_exchanges": KEEP_RECENT_EXCHANGES,
-            "stage_run_id": conversation.get("task_state", {}).get("stage_run_id"),
+            "stage_run_id": conversation.get("task_state", {}).get("stage_run_id") if stage_scoped else None,
         }
     if mode == SLIDING_MODE:
         limit = context["sliding_window_exchanges"]
@@ -340,21 +340,22 @@ def request_history(conversation: dict[str, Any]) -> tuple[list[dict[str, Any]],
         limit = None
         selected = exchanges
     history = [deepcopy(message) for exchange in selected for message in exchange["messages"]]
-    facts = [{"key": item["key"], "value": item["value"]} for item in current_stage_facts(conversation) if item.get("key") and item.get("value")] if mode == FACTS_MODE else []
+    fact_items = current_stage_facts(conversation) if stage_scoped else conversation.get("facts", [])
+    facts = [{"key": item["key"], "value": item["value"]} for item in fact_items if item.get("key") and item.get("value")] if mode == FACTS_MODE else []
     return history, "", facts, {
         "mode": mode, "summary_id": None, "summary_exchange_count": 0,
         "verbatim_exchange_count": len(selected), "window_exchanges": limit,
         "fact_count": len(facts), "active_leaf_id": context.get("active_leaf_id"),
-        "stage_run_id": conversation.get("task_state", {}).get("stage_run_id"),
+        "stage_run_id": conversation.get("task_state", {}).get("stage_run_id") if stage_scoped else None,
     }
 
 
-def update_sticky_facts(conversation: dict[str, Any], agent: Agent, user_text: str) -> dict[str, Any] | None:
+def update_sticky_facts(conversation: dict[str, Any], agent: Agent, user_text: str, *, stage_scoped: bool = True) -> dict[str, Any] | None:
     context = ensure_context_management(conversation)
     if context["mode"] != FACTS_MODE:
         return None
-    stage_run_id = conversation.get("task_state", {}).get("stage_run_id")
-    stage_items = current_stage_facts(conversation)
+    stage_run_id = conversation.get("task_state", {}).get("stage_run_id") if stage_scoped else None
+    stage_items = current_stage_facts(conversation) if stage_scoped else conversation.get("facts", [])
     current = [{"key": item.get("key"), "value": item.get("value"), "locked": bool(item.get("locked"))} for item in stage_items]
     revision: dict[str, Any] = {"id": uuid.uuid4().hex, "created_at": now_iso(), "purpose": "facts_update"}
     try:

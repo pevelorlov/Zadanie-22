@@ -101,6 +101,39 @@ class FakeProvider:
         )
 
 
+class FakeRagIndexService:
+    def __init__(self):
+        self.retrieve_calls = []
+
+    def state(self):
+        return {
+            "documents_dir": "test-rag-documents", "supported_extensions": [".pdf"],
+            "files": [], "file_count": 0, "job": {"running": False, "phase": "idle"},
+            "latest_run": {"id": "run-test"}, "sources": ["source.pdf"], "model_name": "fake",
+        }
+
+    def start_build(self, settings):
+        return {"running": True, "phase": "queued"}
+
+    def list_chunks(self, strategy, page=1, page_size=20, source=""):
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "run_id": "run-test"}
+
+    def search(self, query, top_k):
+        return {"query": query, "top_k": int(top_k), "run_id": "run-test", "results": {"fixed": [], "structural": []}}
+
+    def retrieve(self, query, strategy="structural", top_k=5):
+        self.retrieve_calls.append((query, strategy, int(top_k)))
+        return {
+            "query": query, "strategy": strategy, "top_k": int(top_k), "run_id": "run-test",
+            "chunks": [{
+                "chunk_id": "chunk-test", "strategy": "structural", "source": "source.pdf",
+                "title": "Источник", "section": "Раздел", "page": 3, "chunk_order": 0,
+                "token_count": 12, "text": "Точный факт из локального документа.",
+                "text_hash": "hash-test", "score": 0.91,
+            }],
+        }
+
+
 class ToolAwareFakeProvider(FakeProvider):
     def complete_with_tools(self, messages, settings, tools, tool_executor):
         base = super().complete(messages, settings)
@@ -1116,12 +1149,23 @@ class ApiTests(unittest.TestCase):
         self.assertIn('id="task-state-show"', text)
         self.assertIn('id="task-transition-mode"', text)
         self.assertIn('id="task-autopilot-stop"', text)
+        self.assertIn('id="task-control-disable"', text)
+        self.assertIn('id="task-control-enable"', text)
         self.assertNotIn("Свободные этапы · День 13", text)
         self.assertIn('id="invariants-title"', text)
         self.assertIn('id="invariant-scope"', text)
+        self.assertIn('id="rag-view-button"', text)
+        self.assertIn('id="rag-panel"', text)
+        self.assertIn("Построить оба индекса", text)
+        self.assertIn("Найти в обоих индексах", text)
+        self.assertIn('id="chat-rag-enabled"', text)
+        self.assertIn('id="rag-compare-form"', text)
+        self.assertIn("Ответ без RAG и с RAG", text)
         self.assertIn('id="mcp-start"', text)
         self.assertIn('id="mcp-tools"', text)
         self.assertIn('id="mcp-stop"', text)
+        self.assertIn('id="mcp-disable-all"', text)
+        self.assertIn('id="mcp-enable-all"', text)
         self.assertIn('id="weather-mcp-start"', text)
         self.assertIn("Open‑Meteo MCP", text)
         self.assertIn("только папку проекта <code>workspace</code>", text)
@@ -1129,6 +1173,86 @@ class ApiTests(unittest.TestCase):
         self.assertIn("preferences.language", text)
         self.assertNotIn("Запустить 3 температуры", text)
         self.assertNotIn('id="message-input" maxlength="50000" rows="1" placeholder="Напишите сообщение…" required', text)
+
+    def test_rag_state_and_empty_index_endpoints_are_local(self):
+        state = self.client.get("/api/rag/state")
+        self.assertEqual(state.status_code, 200)
+        payload = state.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["files"], [])
+        self.assertIn(".docx", payload["supported_extensions"])
+        self.assertTrue(Path(payload["documents_dir"]).is_dir())
+        chunks = self.client.get("/api/rag/chunks?strategy=fixed")
+        self.assertEqual(chunks.status_code, 200)
+        self.assertEqual(chunks.get_json()["items"], [])
+        search = self.client.post("/api/rag/search", json={"query": "тест", "top_k": 5})
+        self.assertEqual(search.status_code, 409)
+        self.assertIn("постройте индекс", search.get_json()["error"].lower())
+
+    def test_chat_rag_toggle_adds_chunks_and_request_snapshot(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "rag-chat", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Какой точный факт указан в документе?",
+            "settings": AgentSettings().to_dict(),
+            "rag": {"enabled": True, "strategy": "combined", "top_k": 5},
+        })
+        self.assertEqual(response.status_code, 200)
+        saved = response.get_json()["conversation"]["messages"]
+        user = next(item for item in saved if item["role"] == "user")
+        assistant = next(item for item in saved if item["role"] == "assistant")
+        self.assertTrue(user["technical"]["rag"]["enabled"])
+        self.assertEqual(user["technical"]["rag"]["chunks"][0]["source"], "source.pdf")
+        self.assertEqual(assistant["technical"]["rag"]["strategy"], "combined")
+        self.assertEqual(rag.retrieve_calls, [("Какой точный факт указан в документе?", "combined", 5)])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", generation)
+        self.assertIn("Точный факт из локального документа", generation)
+
+    def test_chat_without_rag_preserves_previous_prompt(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        app = create_app(Path(self.temp.name) / "no-rag-chat", Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Без RAG"}).get_json()["conversation"]
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Обычный вопрос", "settings": AgentSettings().to_dict(),
+            "rag": {"enabled": False, "strategy": "structural", "top_k": 5},
+        })
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(rag.retrieve_calls, [])
+        generation = policy_generation_calls(provider)[0][0][0]["content"]
+        self.assertNotIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", generation)
+
+    def test_rag_comparison_uses_two_calls_and_does_not_change_dialogue(self):
+        rag = FakeRagIndexService()
+        provider = FakeProvider()
+        data_dir = Path(self.temp.name) / "rag-compare"
+        app = create_app(data_dir, Agent(provider), self.voice, self.mcp, rag_index_service=rag)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Сравнение"}).get_json()["conversation"]
+        before = len(conversation["messages"])
+        response = client.post(f"/api/conversations/{conversation['id']}/rag-compare", json={
+            "question": "Что сказано в источнике?", "strategy": "structural", "top_k": 5,
+            "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(response.status_code, 200)
+        evaluation = response.get_json()["evaluation"]
+        self.assertEqual(evaluation["retrieval"]["chunks"][0]["chunk_id"], "chunk-test")
+        self.assertEqual(len(provider.calls), 2)
+        self.assertNotIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", provider.calls[0][0][0]["content"])
+        self.assertIn("ДОКУМЕНТАЛЬНЫЙ КОНТЕКСТ RAG", provider.calls[1][0][0]["content"])
+        after = client.get(f"/api/conversations/{conversation['id']}").get_json()["conversation"]
+        self.assertEqual(len(after["messages"]), before)
+        evaluations = client.get("/api/rag/evaluations").get_json()["items"]
+        self.assertEqual(len(evaluations), 1)
+        self.assertTrue((data_dir / "rag_evaluations.json").exists())
 
     def test_state_exposes_model_context_windows(self):
         provider = self.client.get("/api/state").get_json()["provider"]
@@ -1164,6 +1288,124 @@ class ApiTests(unittest.TestCase):
         unavailable = self.client.get("/api/mcp/tools")
         self.assertEqual(unavailable.status_code, 409)
         self.assertFalse(unavailable.get_json()["mcp"]["connected"])
+
+    def test_master_mcp_switch_stops_every_server_and_blocks_restart(self):
+        data_dir = Path(self.temp.name) / "mcp-control"
+        filesystem = FakeMCPManager()
+        filesystem.running = True
+        weather = FakeWeatherMCPManager(running=True)
+        scheduler_mcp = FakeMCPManager()
+        scheduler_mcp.running = True
+        mediawiki = FakeOrchestrationMCPManager("mediawiki-test", ["search-page"], {}, running=True)
+        worldbank = FakeOrchestrationMCPManager("worldbank-test", ["worldbank_get_data"], {}, running=True)
+        app = create_app(
+            data_dir,
+            Agent(FakeProvider()),
+            self.voice,
+            filesystem,
+            weather,
+            scheduler_mcp_manager=scheduler_mcp,
+            mediawiki_mcp_manager=mediawiki,
+            worldbank_mcp_manager=worldbank,
+        )
+        app.config.update(TESTING=True)
+        client = app.test_client()
+
+        disabled = client.post("/api/mcp-control/disable", json={})
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(disabled.get_json()["control"]["enabled"])
+        for manager in (filesystem, weather, scheduler_mcp, mediawiki, worldbank):
+            self.assertFalse(manager.running)
+            self.assertEqual(manager.stop_calls, 1)
+        saved = json.loads((data_dir / "mcp_control.json").read_text(encoding="utf-8"))
+        self.assertFalse(saved["enabled"])
+
+        self.assertEqual(client.post("/api/mcp/start").status_code, 409)
+        self.assertEqual(client.post("/api/weather-mcp/start").status_code, 409)
+        self.assertEqual(client.post("/api/orchestration-mcp/mediawiki/start").status_code, 409)
+        self.assertEqual(client.get("/api/scheduler/tools").status_code, 409)
+
+        restarted_mediawiki = FakeOrchestrationMCPManager("mediawiki-test", ["search-page"], {}, running=False)
+        restarted_worldbank = FakeOrchestrationMCPManager("worldbank-test", ["worldbank_get_data"], {}, running=False)
+        restarted = create_app(
+            data_dir,
+            Agent(FakeProvider()),
+            self.voice,
+            FakeMCPManager(),
+            FakeWeatherMCPManager(),
+            scheduler_mcp_manager=FakeMCPManager(),
+            mediawiki_mcp_manager=restarted_mediawiki,
+            worldbank_mcp_manager=restarted_worldbank,
+            orchestration_autostart=True,
+        )
+        restarted.config.update(TESTING=True)
+        self.assertFalse(restarted.test_client().get("/api/mcp-control").get_json()["control"]["enabled"])
+        self.assertEqual(restarted_mediawiki.start_calls, 0)
+        self.assertEqual(restarted_worldbank.start_calls, 0)
+
+        enabled = client.post("/api/mcp-control/enable", json={})
+        self.assertEqual(enabled.status_code, 200)
+        self.assertTrue(enabled.get_json()["control"]["enabled"])
+        self.assertFalse(filesystem.running)
+        self.assertEqual(client.post("/api/mcp/start").status_code, 200)
+        self.assertTrue(filesystem.running)
+
+    def test_master_task_switch_bypasses_lifecycle_and_persists(self):
+        data_dir = Path(self.temp.name) / "task-control"
+        provider = FakeProvider()
+        app = create_app(data_dir, Agent(provider), self.voice, FakeMCPManager())
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        conversation = client.post("/api/conversations", json={"title": "Обычный чат"}).get_json()["conversation"]
+        endpoint = f"/api/conversations/{conversation['id']}"
+
+        self.assertTrue(client.get("/api/task-control").get_json()["control"]["enabled"])
+        self.assertEqual(client.post(f"{endpoint}/task-state/events", json={"event": "pause"}).status_code, 200)
+        disabled = client.post("/api/task-control/disable", json={})
+        self.assertEqual(disabled.status_code, 200)
+        self.assertFalse(disabled.get_json()["control"]["enabled"])
+        self.assertFalse(json.loads((data_dir / "task_control.json").read_text(encoding="utf-8"))["enabled"])
+        self.assertEqual(client.patch(f"{endpoint}/task-state", json={"plan": "Новый план"}).status_code, 409)
+        self.assertEqual(client.post(f"{endpoint}/task-state/events", json={"event": "resume"}).status_code, 409)
+
+        sent = client.post(f"{endpoint}/messages", json={
+            "content": "Ответь как в обычном чате", "settings": AgentSettings().to_dict(),
+        })
+        self.assertEqual(sent.status_code, 200)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertNotIn("ОГРАНИЧЕНИЯ КОНТРОЛИРУЕМОГО ОТВЕТА", provider.calls[0][0][0]["content"])
+        assistant = sent.get_json()["conversation"]["visible_messages"][-1]
+        self.assertFalse(assistant["technical"]["task_control"]["enabled"])
+        self.assertNotIn("policy_audit", assistant["technical"])
+        self.assertEqual(sent.get_json()["conversation"]["task_state"]["activity"], "paused")
+        self.assertEqual(client.post(f"{endpoint}/messages", json={
+            "automatic": True, "settings": AgentSettings().to_dict(),
+        }).status_code, 409)
+
+        restarted = create_app(data_dir, Agent(FakeProvider()), self.voice, FakeMCPManager())
+        restarted.config.update(TESTING=True)
+        self.assertFalse(restarted.test_client().get("/api/task-control").get_json()["control"]["enabled"])
+        self.assertTrue(client.post("/api/task-control/enable", json={}).get_json()["control"]["enabled"])
+
+    def test_disabled_master_switch_prevents_lazy_filesystem_start(self):
+        data_dir = Path(self.temp.name) / "mcp-disabled-chat"
+        workspace = data_dir / "workspace"
+        filesystem = FakeFilesystemWriteMCPManager(workspace)
+        provider = FakeProvider()
+        app = create_app(data_dir, Agent(provider), self.voice, filesystem)
+        app.config.update(TESTING=True)
+        client = app.test_client()
+        self.assertEqual(client.post("/api/mcp-control/disable", json={}).status_code, 200)
+        conversation = client.post("/api/conversations", json={"title": "Без MCP"}).get_json()["conversation"]
+
+        response = client.post(f"/api/conversations/{conversation['id']}/messages", json={
+            "content": "Сохрани ответ в файл.",
+            "settings": AgentSettings().to_dict(),
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(filesystem.start_calls, 0)
+        self.assertEqual(filesystem.called, [])
 
     def test_weather_mcp_has_separate_lifecycle_routes(self):
         weather = FakeWeatherMCPManager()
